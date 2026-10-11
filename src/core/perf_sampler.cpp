@@ -32,9 +32,11 @@ namespace {
 } // Anonymous namespace
 
 void ApplyGameProfile(std::string_view serial) {
-    // inFAMOUS Second Son (US, EU): settings measured on this game. perf_tuning.ini can change
-    // any of them, SHADPS4_GAME_PROFILE=0 leaves the emulator defaults.
-    constexpr std::array<std::string_view, 2> InfamousSecondSon{"CUSA00004", "CUSA00223"};
+    // inFAMOUS Second Son (EU, US, HK): emulator-level settings shared across regions.
+    // Game executable patches remain region/version specific. perf_tuning.ini can change
+    // any of these settings, SHADPS4_GAME_PROFILE=0 leaves the emulator defaults.
+    constexpr std::array<std::string_view, 3> InfamousSecondSon{
+        "CUSA00004", "CUSA00223", "CUSA00309"};
     if (std::ranges::find(InfamousSecondSon, serial) == InfamousSecondSon.end()) {
         return;
     }

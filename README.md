@@ -50,13 +50,28 @@ in inFAMOUS Second Son:
   another version of the game the patch is skipped instead of corrupting the code, and the patch file
   does not need to contain any code of the game.
 
-These options are switched on automatically for inFAMOUS Second Son (CUSA00004, CUSA00223). Other
-games keep the default values (most options off). This build is only tested with inFAMOUS Second Son.
+These emulator-level options are switched on automatically for inFAMOUS Second Son (CUSA00004,
+CUSA00223, CUSA00309). Other games keep the default values (most options off). CUSA00309 (Hong Kong)
+now uses the same performance profile and enables Windows guest red-zone protection. User runs
+on both official 0.19.0 and AYOUB 1.0 reached the spray tutorial after enabling this protection.
+Complete playability and stable 4K/60 FPS remain unverified.
+Mouse motion (orientation and shake), mouse-button single/two-finger contacts, and Windows
+Precision Touchpad input have also been ported from the user's local engine. These source changes
+need a new build and runtime validation; see the [input controls and checks](documents/Debugging/infamous-mouse-input-port.md).
+The executable patches below cover European CUSA00004 APP_VER 01.00 and the analyzed Hong Kong
+CUSA00309 APP_VER 01.07 executable. Other regional revisions are not covered by these patch files.
 
 ### Game patches
 
-`user-files\patches\shadPS4-AYOUB1080p\inFAMOUS Second Son.xml` in the release zip, for the European game
-CUSA00004 (APP_VER 01.00):
+The `user-files\patches\shadPS4-AYOUB1080p\` directory contains two separate patch files:
+
+- `inFAMOUS Second Son.xml`: European CUSA00004, APP_VER 01.00.
+- `inFAMOUS Second Son CUSA00309.xml`: Hong Kong CUSA00309, APP_VER 01.07. All 48 lines of the
+  11 patches below match the original-byte hashes in the analyzed executable; collision payload
+  branches, writable counter storage and FOV references were also checked. See the
+  [Hong Kong analysis and launch instructions](documents/Debugging/infamous-CUSA00309-adaptation.md).
+
+Both files offer the following patches and defaults:
 
 | Patch | Default | What it does |
 | --- | --- | --- |
@@ -71,9 +86,9 @@ CUSA00004 (APP_VER 01.00):
 
 Switch a patch on or off with `isEnabled="true"` or `"false"` in the file, then restart the game.
 The checkerboard rendering of the PS4 Pro mode shows a green screen in shadPS4: this build turns it off
-by itself for this game, whatever the launcher or the patch files, so without a "PS4 Pro mode" patch
-the Pro mode renders in native 1920x1080. Without the PS4 Pro mode (`neo_mode` false) the game runs in
-1080p: switch the "PS4 Pro mode" patch off then.
+by itself for the matching CUSA00004 executable and CUSA00309 APP_VER 01.07, whatever the launcher or
+the patch files. Without a "PS4 Pro mode" resolution patch, Pro mode renders in native 1920x1080.
+Without PS4 Pro mode (`neo_mode` false), the game runs in 1080p: switch the "PS4 Pro mode" patch off then.
 
 ### Install
 
@@ -84,6 +99,10 @@ the Pro mode renders in native 1920x1080. Without the PS4 Pro mode (`neo_mode` f
    - `custom_configs\CUSA00004.json`: the settings this build is tested with (PS4 Pro mode, precise
      GPU readbacks, 512 MB of extra memory, pipeline cache). If you already have this file, add these
      values to yours.
+   - `custom_configs\CUSA00309.json`: Hong Kong settings (PS4 Pro mode, precise GPU readbacks,
+     512 MB of extra memory, pipeline cache, Windows guest red-zone protection). The Hong Kong patch file defaults to native 3200x1800;
+     native 3840x2160 and 2560x1440 are selectable alternatives. Merge these values into an existing
+     per-game config to retain any diagnostic or personal settings.
 3. Start the game with `shadps4.exe -g "<game folder>\CUSA00004\eboot.bin"`, or select this
    `shadps4.exe` in your launcher (check that the patches are enabled there).
 
@@ -159,14 +178,25 @@ ralentissements de la ville dans inFAMOUS Second Son :
   octets qu'elle remplace. Sur une autre version du jeu, le patch est ignoré au lieu d'abîmer le code,
   et le fichier de patchs n'a besoin de contenir aucun code du jeu.
 
-Ces options s'activent automatiquement pour inFAMOUS Second Son (CUSA00004, CUSA00223). Les autres jeux
-gardent les valeurs par défaut (la plupart des options désactivées). Cette build n'est testée qu'avec
-inFAMOUS Second Son.
+Ces options de l'émulateur s'activent automatiquement pour inFAMOUS Second Son (CUSA00004, CUSA00223,
+CUSA00309). Les autres jeux gardent les valeurs par défaut (la plupart des options désactivées).
+CUSA00309 (Hong Kong) utilise désormais le même profil de performances et active la protection
+Windows de la red zone. Les essais utilisateur sur shadPS4 officiel 0.19.0 et AYOUB 1.0 ont atteint
+le tutoriel de peinture après son activation. La jouabilité
+complète et la stabilité en 4K/60 FPS ne sont pas confirmées. Les patchs ci-dessous couvrent CUSA00004 version 01.00 et l'exécutable
+CUSA00309 version 01.07 analysé. Les autres révisions régionales ne sont pas couvertes.
 
 ### Patchs du jeu
 
-`user-files\patches\shadPS4-AYOUB1080p\inFAMOUS Second Son.xml` dans le zip de la release, pour le jeu
-européen CUSA00004 (APP_VER 01.00) :
+Le dossier `user-files\patches\shadPS4-AYOUB1080p\` contient deux fichiers distincts :
+
+- `inFAMOUS Second Son.xml` : CUSA00004 européen, APP_VER 01.00.
+- `inFAMOUS Second Son CUSA00309.xml` : CUSA00309 Hong Kong, APP_VER 01.07. Les 48 lignes des
+  11 patchs correspondent aux sommes de contrôle des octets d'origine de l'exécutable analysé.
+  Les sauts du correctif de collisions, le compteur et les références du champ de vision ont
+  également été vérifiés. Voir les [instructions Hong Kong](documents/Debugging/infamous-CUSA00309-adaptation.md).
+
+Les deux fichiers proposent les patchs et valeurs par défaut suivants :
 
 | Patch | Par défaut | Effet |
 | --- | --- | --- |
@@ -181,9 +211,10 @@ européen CUSA00004 (APP_VER 01.00) :
 
 Pour activer ou désactiver un patch : `isEnabled="true"` ou `"false"` dans le fichier, puis relancer le
 jeu. Le rendu en damier du mode PS4 Pro donne un écran vert dans shadPS4 : cette build le coupe
-d'elle-même pour ce jeu, quels que soient le lanceur et les fichiers de patchs ; sans patch « PS4 Pro
-mode », le mode Pro rend donc en 1920x1080 natif. Sans le mode PS4 Pro (`neo_mode` à false), le jeu tourne
-en 1080p : désactiver alors le patch « PS4 Pro mode ».
+d'elle-même pour l'exécutable CUSA00004 correspondant et CUSA00309 APP_VER 01.07, quels que soient le
+lanceur et les fichiers de patchs. Sans patch de résolution « PS4 Pro mode », le mode Pro rend en
+1920x1080 natif. Sans le mode PS4 Pro (`neo_mode` à false), le jeu tourne en 1080p : désactiver alors
+le patch « PS4 Pro mode ».
 
 ### Installation
 
@@ -195,6 +226,10 @@ en 1080p : désactiver alors le patch « PS4 Pro mode ».
    - `custom_configs\CUSA00004.json` : les réglages avec lesquels cette build est testée (mode PS4 Pro,
      relectures GPU précises, 512 Mo de mémoire en plus, cache de pipelines). Si vous avez déjà ce
      fichier, ajoutez-y ces valeurs.
+   - `custom_configs\CUSA00309.json` : réglages Hong Kong (mode PS4 Pro, relectures GPU précises,
+     512 Mo de mémoire en plus, cache de pipelines, protection Windows de la red zone). Le fichier Hong Kong active par défaut le rendu
+     natif en 3200x1800 ; 3840x2160 et 2560x1440 sont des alternatives sélectionnables. Ajoutez ces
+     valeurs à une configuration existante pour conserver vos réglages personnels.
 3. Lancer le jeu avec `shadps4.exe -g "<dossier du jeu>\CUSA00004\eboot.bin"`, ou choisir ce
    `shadps4.exe` dans votre lanceur (vérifiez que les patchs y sont activés).
 

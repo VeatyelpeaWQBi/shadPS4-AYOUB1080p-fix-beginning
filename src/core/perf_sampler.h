@@ -20,7 +20,9 @@ void Stop();
 
 /**
  * Settings measured on some games, applied at startup before perf_tuning.ini (which can change
- * any of them): inFAMOUS Second Son (CUSA00004, CUSA00223). SHADPS4_GAME_PROFILE=0 disables it.
+ * any of them): inFAMOUS Second Son (CUSA00004, CUSA00223, CUSA00309).
+ * Emulator-level settings are shared across regions; executable patches are separate.
+ * SHADPS4_GAME_PROFILE=0 disables it.
  */
 void ApplyGameProfile(std::string_view serial);
 

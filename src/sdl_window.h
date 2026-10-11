@@ -3,8 +3,12 @@
 
 #pragma once
 
+#include <array>
+#include <atomic>
+#include <memory>
 #include <span>
 #include <string>
+#include <SDL3/SDL_timer.h>
 
 #include "common/types.h"
 #include "core/libraries/pad/pad.h"
@@ -16,6 +20,9 @@ union SDL_Event;
 
 namespace Input {
 class GameController;
+#ifdef _WIN32
+class WindowsTouchpad;
+#endif
 }
 
 namespace Frontend {
@@ -45,7 +52,7 @@ struct WindowSystemInfo {
 };
 
 class WindowSDL {
-    int keyboard_grab = 0;
+    std::atomic<int> keyboard_grab{0};
 
 public:
     explicit WindowSDL(s32 width, s32 height, Input::GameControllers* controllers,
@@ -93,6 +100,11 @@ private:
     SDL_Window* window{};
     bool is_shown{};
     bool is_open{true};
+    std::array<SDL_TimerID, 4> controller_timers{};
+    SDL_TimerID mouse_timer{};
+#ifdef _WIN32
+    std::unique_ptr<Input::WindowsTouchpad> native_touchpad;
+#endif
 };
 
 void SetWindowIcon(SDL_Window* window, const std::vector<u8>& png);

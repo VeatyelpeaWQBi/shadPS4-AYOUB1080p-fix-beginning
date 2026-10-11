@@ -178,6 +178,8 @@ std::filesystem::path GetInputConfigFile(const std::string& game_id) {
             {"hotkey_add_virtual_user", "f5"},
             {"hotkey_remove_virtual_user", "f4"},
             {"hotkey_toggle_mouse_to_touchpad", "delete"},
+            {"hotkey_center_mouse_emulation", "home"},
+            {"hotkey_release_mouse_emulation", "escape"},
             {"hotkey_quit", "lctrl, lshift, end"},
             {"hotkey_volume_up", "kpplus"},
             {"hotkey_volume_down", "kpminus"},
@@ -779,6 +781,12 @@ void ControllerOutput::FinalizeUpdate(u8 gamepad_index) {
             break;
         case HOTKEY_TOGGLE_MOUSE_TO_TOUCHPAD:
             PushSDLEvent(SDL_EVENT_MOUSE_TO_TOUCHPAD);
+            break;
+        case HOTKEY_CENTER_MOUSE_EMULATION:
+            PushSDLEvent(SDL_EVENT_CENTER_MOUSE_EMULATION);
+            break;
+        case HOTKEY_RELEASE_MOUSE_EMULATION:
+            PushSDLEvent(SDL_EVENT_RELEASE_MOUSE_EMULATION);
             break;
         case HOTKEY_RENDERDOC:
             PushSDLEvent(SDL_EVENT_RDOC_CAPTURE);

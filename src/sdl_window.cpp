@@ -29,6 +29,10 @@
 #include "input/input_mouse.h"
 #include "sdl_window.h"
 #include "video_core/renderdoc.h"
+#ifdef _WIN32
+#include <SDL3/SDL_system.h>
+#include "input/windows_touchpad.h"
+#endif
 
 #ifdef __APPLE__
 #include <SDL3/SDL_metal.h>
@@ -188,9 +192,29 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
     if (EmulatorSettings.IsBackgroundControllerInput()) {
         SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
     }
+#ifdef _WIN32
+    native_touchpad = std::make_unique<Input::WindowsTouchpad>();
+    native_touchpad->Attach(static_cast<HWND>(window_info.render_surface));
+    SDL_SetWindowsMessageHook([](void* context, MSG* message) -> bool {
+        auto& self = *static_cast<WindowSDL*>(context);
+        const bool allowed = self.keyboard_grab == 0 && !ImGui::Core::IsGamepadInputCaptured() &&
+            GetForegroundWindow() == static_cast<HWND>(self.window_info.render_surface);
+        self.native_touchpad->Message(*message, Input::GetMouseInput(), allowed, SDL_GetTicks());
+        return true; // Keep SDL/Windows cleanup and normal OS touchpad gestures.
+    }, this);
+#endif
 }
 
-WindowSDL::~WindowSDL() = default;
+WindowSDL::~WindowSDL() {
+    if (mouse_timer) SDL_RemoveTimer(mouse_timer);
+    for (const auto timer : controller_timers) if (timer) SDL_RemoveTimer(timer);
+#ifdef _WIN32
+    SDL_SetWindowsMessageHook(nullptr, nullptr);
+    native_touchpad.reset();
+#endif
+    Input::ReleaseMouseInput(controllers[0]);
+    SDL_SetWindowRelativeMouseMode(window, false);
+}
 
 void WindowSDL::SetIcon(std::span<const u8> png_data) {
     if (png_data.empty()) {
@@ -209,11 +233,29 @@ void WindowSDL::WaitEvent() {
         return;
     }
 
-    if (Libraries::Mouse::PushSDLEvent(event) || Libraries::Keyboard::PushSDLEvent(event)) {
+    const bool overlay_captured = ImGui::Core::ProcessEvent(&event);
+    const bool mouse_allowed = !overlay_captured && keyboard_grab == 0 &&
+        !ImGui::Core::IsGamepadInputCaptured() &&
+        (SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS) &&
+        !(event.type == SDL_EVENT_WINDOW_FOCUS_LOST &&
+          event.window.windowID == SDL_GetWindowID(window));
+    if (!mouse_allowed) {
+#ifdef _WIN32
+        native_touchpad->Reset();
+#endif
+        Input::ReleaseMouseInput(controllers[0]);
+        SDL_SetWindowRelativeMouseMode(window, false);
+        Input::ActivateOutputsFromInputs();
+    } else if ((event.type == SDL_EVENT_MOUSE_MOTION &&
+                event.motion.windowID == SDL_GetWindowID(window)) ||
+               ((event.type == SDL_EVENT_MOUSE_BUTTON_DOWN || event.type == SDL_EVENT_MOUSE_BUTTON_UP) &&
+                event.button.windowID == SDL_GetWindowID(window))) {
+        Input::ProcessMouseEvent(event);
+    }
+    if (overlay_captured) {
         return;
     }
-
-    if (ImGui::Core::ProcessEvent(&event)) {
+    if (Libraries::Mouse::PushSDLEvent(event) || Libraries::Keyboard::PushSDLEvent(event)) {
         return;
     }
 
@@ -287,17 +329,39 @@ void WindowSDL::WaitEvent() {
         Input::ParseInputConfig(std::string(Common::ElfInfo::Instance().GameSerial()));
         break;
     case SDL_EVENT_MOUSE_TO_JOYSTICK:
+        if (!mouse_allowed) break;
         SDL_SetWindowRelativeMouseMode(this->GetSDLWindow(),
                                        Input::ToggleMouseModeTo(Input::MouseMode::Joystick));
+        Input::ActivateOutputsFromInputs();
         break;
     case SDL_EVENT_MOUSE_TO_GYRO:
+        if (!mouse_allowed) break;
         SDL_SetWindowRelativeMouseMode(this->GetSDLWindow(),
                                        Input::ToggleMouseModeTo(Input::MouseMode::Gyro));
+        Input::ActivateOutputsFromInputs();
         break;
     case SDL_EVENT_MOUSE_TO_TOUCHPAD:
+        if (!mouse_allowed) break;
+#ifdef _WIN32
+        native_touchpad->Reset();
+#endif
         SDL_SetWindowRelativeMouseMode(this->GetSDLWindow(),
                                        Input::ToggleMouseModeTo(Input::MouseMode::Touchpad));
-        SDL_SetWindowRelativeMouseMode(this->GetSDLWindow(), false);
+        Input::ActivateOutputsFromInputs();
+        break;
+    case SDL_EVENT_CENTER_MOUSE_EMULATION:
+#ifdef _WIN32
+        native_touchpad->Reset();
+#endif
+        if (mouse_allowed) Input::CenterMouseInput();
+        break;
+    case SDL_EVENT_RELEASE_MOUSE_EMULATION:
+#ifdef _WIN32
+        native_touchpad->Reset();
+#endif
+        Input::ReleaseMouseInput(controllers[0]);
+        SDL_SetWindowRelativeMouseMode(window, false);
+        Input::ActivateOutputsFromInputs();
         break;
     case SDL_EVENT_ADD_VIRTUAL_USER:
         for (int i = 0; i < 4; i++) {
@@ -341,15 +405,23 @@ void WindowSDL::WaitEvent() {
 
 void WindowSDL::InitTimers() {
     for (int i = 0; i < 4; ++i) {
-        SDL_AddTimer(4, &PollController, controllers[i]);
+        controller_timers[i] = SDL_AddTimer(4, &PollController, controllers[i]);
     }
-    SDL_AddTimer(33, Input::MousePolling, (void*)controllers[0]);
+    mouse_timer = SDL_AddTimer(8, Input::MousePolling, (void*)controllers[0]);
 }
 
 void WindowSDL::RequestKeyboard() {
     if (keyboard_grab == 0) {
         SDL_RunOnMainThread(
-            [](void* userdata) { SDL_StartTextInput(static_cast<SDL_Window*>(userdata)); }, window,
+            [](void* userdata) {
+                auto& self = *static_cast<WindowSDL*>(userdata);
+#ifdef _WIN32
+                self.native_touchpad->Reset();
+#endif
+                Input::ReleaseMouseInput(self.controllers[0]);
+                SDL_SetWindowRelativeMouseMode(self.window, false);
+                SDL_StartTextInput(self.window);
+            }, this,
             true);
     }
     keyboard_grab++;

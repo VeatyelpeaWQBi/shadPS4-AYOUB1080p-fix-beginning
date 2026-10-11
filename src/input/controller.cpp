@@ -62,7 +62,7 @@ GameController::GameController() : m_states_queue(64) {}
 
 State GameController::ReadState() {
     std::lock_guard lock{m_state_mutex};
-    return m_state;
+    return ReportStateLocked(false);
 }
 
 int GameController::ReadStates(State* states, int states_num) {
@@ -76,10 +76,10 @@ int GameController::ReadStates(State* states, int states_num) {
         return 1;
     }
 
-    if (states_num == 1) {
+    if (states_num == 1 || m_mouse_motion_active || m_mouse_touch_active) {
         // Retained history can make a later multi-sample read return up to 64 stale reports, so
         // mixed single- and multi-sample reads require dedicated tests.
-        states[0] = m_state;
+        states[0] = ReportStateLocked(true);
         return 1;
     }
 
@@ -126,7 +126,103 @@ void GameController::ResetOrientation() {
     std::lock_guard lock{m_state_mutex};
     m_state.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
     m_last_orientation_update = 0;
+    if (m_mouse_motion_active) {
+        m_mouse_motion.ResetOrientation();
+        m_mouse_motion_report.orientation = m_mouse_motion.Orientation();
+    }
     PushStateLocked();
+}
+
+void GameController::SetMouseInput(const MouseSample& sample, bool roll_mode) {
+    std::lock_guard lock{m_state_mutex};
+    const bool motion = sample.mode == MouseMode::Gyro;
+    const bool touch = sample.mode == MouseMode::Touchpad;
+    const bool changed_mode = motion != m_mouse_motion_active || touch != m_mouse_touch_active;
+    if (changed_mode) {
+        // Switching back to hardware must not replay a retained emulation report.
+        m_states_queue.Clear();
+        m_pending_mouse_touches.clear();
+        m_mouse_touch = m_last_mouse_touch = {};
+        m_mouse_touch_start = 0;
+    }
+    m_mouse_motion_active = motion;
+    m_mouse_touch_active = touch;
+    m_mouse_trigger = motion && sample.trigger;
+    m_mouse_motion_report = m_mouse_motion.Step(Libraries::Kernel::sceKernelGetProcessTime(),
+        motion, sample.center, sample.dx, sample.dy, 0.003f, roll_mode);
+    const u64 now = Libraries::Kernel::sceKernelGetProcessTime();
+    if (motion && (changed_mode || now-m_mouse_motion_log_time >= 1000000)) {
+        const auto& q = m_mouse_motion_report.orientation;
+        const auto& a = m_mouse_motion_report.acceleration;
+        const auto& w = m_mouse_motion_report.angular_velocity;
+        LOG_DEBUG(Input, "Mouse motion report: q={},{},{},{} g={},{},{} rad/s={},{},{} R2={} sensors={}",
+                  q[0], q[1], q[2], q[3], a[0], a[1], a[2], w[0], w[1], w[2],
+                  m_mouse_trigger, m_motion_sensor_enabled);
+        m_mouse_motion_log_time = now;
+    }
+    if (touch && sample.touch != m_last_mouse_touch) {
+        if (m_pending_mouse_touches.size() == 32) m_pending_mouse_touches.pop_front();
+        m_pending_mouse_touches.push_back(sample.touch);
+        m_last_mouse_touch = sample.touch;
+    }
+    PushStateLocked();
+}
+
+void GameController::SetMotionSensorEnabled(bool enabled) {
+    std::lock_guard lock{m_state_mutex};
+    m_motion_sensor_enabled = enabled;
+    PushStateLocked();
+}
+
+void GameController::SetAngularVelocityDeadband(bool enabled) {
+    std::lock_guard lock{m_state_mutex};
+    m_angular_velocity_deadband = enabled;
+}
+
+State GameController::ReportStateLocked(bool advance_touch) {
+    State report = m_state;
+    if (m_mouse_motion_active) {
+        const auto& q = m_mouse_motion_report.orientation;
+        const auto& a = m_mouse_motion_report.acceleration;
+        const auto& w = m_mouse_motion_report.angular_velocity;
+        report.orientation = {q[0], q[1], q[2], q[3]};
+        // libScePad scales SDL acceleration by 0.098. The ported model already uses g.
+        report.acceleration = {a[0]/0.098f, a[1]/0.098f, a[2]/0.098f};
+        report.angularVelocity = {w[0], w[1], w[2]};
+        if (m_angular_velocity_deadband) {
+            if (std::abs(report.angularVelocity.x) < 0.001f) report.angularVelocity.x = 0;
+            if (std::abs(report.angularVelocity.y) < 0.001f) report.angularVelocity.y = 0;
+            if (std::abs(report.angularVelocity.z) < 0.001f) report.angularVelocity.z = 0;
+        }
+    }
+    if (!m_motion_sensor_enabled) {
+        report.orientation = {0, 0, 0, 1};
+        report.acceleration = report.angularVelocity = {0, 0, 0};
+    }
+    if (m_mouse_trigger) {
+        report.buttonsState |= OrbisPadButtonDataOffset::R2;
+        report.axes[static_cast<int>(Axis::TriggerRight)] = 255;
+    }
+    if (m_mouse_touch_active) {
+        if (advance_touch && !m_pending_mouse_touches.empty()) {
+            const auto frame = m_pending_mouse_touches.front();
+            m_pending_mouse_touches.pop_front();
+            if (frame.count && !m_mouse_touch.count) {
+                m_mouse_touch_start = Libraries::Kernel::sceKernelGetProcessTime();
+            } else if (!frame.count) {
+                m_mouse_touch_start = 0;
+            }
+            m_mouse_touch = frame;
+        }
+        for (size_t i = 0; i < 2; ++i) {
+            const auto& contact = m_mouse_touch.contacts[i];
+            report.touchpad[i] = {contact.id, i < m_mouse_touch.count, contact.x, contact.y};
+        }
+        if (m_mouse_touch.clicked) report.buttonsState |= OrbisPadButtonDataOffset::TouchPad;
+        report.touch_time_since_held_down = m_mouse_touch_start
+            ? Libraries::Kernel::sceKernelGetProcessTime()-m_mouse_touch_start : 0;
+    }
+    return report;
 }
 
 void GameController::SetTouchpadState(int touch_index, bool touch_down, float x, float y) {
@@ -184,6 +280,12 @@ void GameController::DisconnectController() {
     m_next_touch_id = 1;
     m_touch_down_timestamp = 0;
     m_state.connected = false;
+    m_mouse_motion = {};
+    m_mouse_motion_active = m_mouse_touch_active = m_mouse_trigger = false;
+    m_pending_mouse_touches.clear();
+    m_mouse_touch_start = 0;
+    m_mouse_motion_log_time = 0;
+    m_motion_sensor_enabled = m_angular_velocity_deadband = true;
     m_last_orientation_update = 0;
     PushStateLocked();
 }
@@ -212,7 +314,7 @@ void GameController::PushStateLocked(u64 timestamp) {
     m_state.time = timestamp;
     m_state.touch_time_since_held_down =
         m_touch_down_timestamp == 0 ? 0 : timestamp - m_touch_down_timestamp;
-    m_states_queue.Push(m_state);
+    m_states_queue.Push(ReportStateLocked(false));
 }
 
 void GameController::SetLightBarRGB(u8 const r, u8 const g, u8 const b) {

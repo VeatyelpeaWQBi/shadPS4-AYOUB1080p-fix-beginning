@@ -9,11 +9,7 @@
 #include "input/input_handler.h"
 #include "input_mouse.h"
 
-#include <common/singleton.h>
-#include <emulator.h>
 #include "SDL3/SDL.h"
-
-extern Frontend::WindowSDL* g_window;
 
 namespace Input {
 
@@ -23,30 +19,71 @@ int mouse_joystick_binding = 0;
 float mouse_deadzone_offset = 0.5, mouse_speed = 1, mouse_speed_offset = 0.1250;
 bool mouse_gyro_roll_mode = false;
 Uint32 mouse_polling_id = 0;
-MouseMode mouse_mode = MouseMode::Off;
+static MouseInput mouse_input;
+static std::mutex mouse_poll_mutex;
+
+static void ForgetCapturedMouseButtons() {
+    const auto mode = mouse_input.Mode();
+    if (mode != MouseMode::Gyro && mode != MouseMode::Touchpad) return;
+    // Require a new press after releasing capture; do not reactivate a held mouse
+    // button through its ordinary game binding. Physical gamepad inputs stay intact.
+    pressed_keys.remove_if([](const auto& key) {
+        return key.first.input.type == InputType::KeyboardMouse &&
+            (key.first.input.sdl_id == SDL_BUTTON_LEFT || key.first.input.sdl_id == SDL_BUTTON_RIGHT);
+    });
+}
 
 // Switches mouse to a set mode or turns mouse emulation off if it was already in that mode.
 // Returns whether the mode is turned on.
 bool ToggleMouseModeTo(MouseMode m) {
-    if (mouse_mode == m) {
-        mouse_mode = MouseMode::Off;
-    } else {
-        mouse_mode = m;
+    std::scoped_lock lock{mouse_poll_mutex};
+    ForgetCapturedMouseButtons();
+    const bool enabled = mouse_input.Toggle(m);
+    constexpr std::array names{"off", "joystick", "motion", "touch contacts"};
+    LOG_INFO(Input, "Mouse emulation mode: {}", names[static_cast<size_t>(mouse_input.Mode())]);
+    return enabled;
+}
+
+MouseMode GetMouseMode() { return mouse_input.Mode(); }
+MouseInput& GetMouseInput() { return mouse_input; }
+void CenterMouseInput() {
+    mouse_input.Center();
+    LOG_INFO(Input, "Mouse emulation center requested");
+}
+void ReleaseMouseInput(GameController* controller) {
+    std::scoped_lock lock{mouse_poll_mutex};
+    const bool active = mouse_input.Mode() != MouseMode::Off;
+    ForgetCapturedMouseButtons();
+    mouse_input.Release();
+    controller->SetMouseInput({});
+    if (active) LOG_INFO(Input, "Mouse emulation released");
+}
+
+void ProcessMouseEvent(const SDL_Event& event) {
+    if (event.type == SDL_EVENT_MOUSE_MOTION) {
+        mouse_input.Motion(event.motion.xrel, event.motion.yrel);
+    } else if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN || event.type == SDL_EVENT_MOUSE_BUTTON_UP) {
+        if (event.button.button == SDL_BUTTON_LEFT || event.button.button == SDL_BUTTON_RIGHT) {
+            mouse_input.Button(event.button.button == SDL_BUTTON_RIGHT,
+                               event.type == SDL_EVENT_MOUSE_BUTTON_DOWN);
+        }
     }
-    return mouse_mode == m;
 }
 
 void SetMouseToJoystick(int joystick) {
+    std::scoped_lock lock{mouse_poll_mutex};
     mouse_joystick_binding = joystick;
 }
 
 void SetMouseParams(float mdo, float ms, float mso) {
+    std::scoped_lock lock{mouse_poll_mutex};
     mouse_deadzone_offset = mdo;
     mouse_speed = ms;
     mouse_speed_offset = mso;
 }
 
 void SetMouseGyroRollMode(bool mode) {
+    std::scoped_lock lock{mouse_poll_mutex};
     mouse_gyro_roll_mode = mode;
 }
 
@@ -85,35 +122,14 @@ void EmulateJoystick(GameController* controller, u32 interval) {
     }
 }
 
-constexpr float constant_down_accel[3] = {0.0f, 9.81f, 0.0f};
-void EmulateGyro(GameController* controller, u32 interval) {
-    float d_x = 0, d_y = 0;
-    SDL_GetRelativeMouseState(&d_x, &d_y);
-    controller->UpdateAcceleration(constant_down_accel);
-    float gyro_from_mouse[3] = {-d_y / 100, -d_x / 100, 0.0f};
-    if (mouse_gyro_roll_mode) {
-        gyro_from_mouse[1] = 0.0f;
-        gyro_from_mouse[2] = -d_x / 100;
-    }
-    controller->UpdateGyro(gyro_from_mouse);
-}
-
-void EmulateTouchpad(GameController* controller, u32 interval) {
-    float x, y;
-    SDL_MouseButtonFlags mouse_buttons = SDL_GetMouseState(&x, &y);
-    controller->SetTouchpadState(0, (mouse_buttons & SDL_BUTTON_LMASK) != 0,
-                                 std::clamp(x / g_window->GetWidth(), 0.0f, 1.0f),
-                                 std::clamp(y / g_window->GetHeight(), 0.0f, 1.0f));
-    controller->Button(Libraries::Pad::OrbisPadButtonDataOffset::TouchPad,
-                       (mouse_buttons & SDL_BUTTON_RMASK) != 0);
-}
-
 void ApplyMouseInputBlockers() {
-    switch (mouse_mode) {
+    switch (GetMouseMode()) {
+    case MouseMode::Gyro:
     case MouseMode::Touchpad:
         for (auto& k : pressed_keys) {
-            if (k.first.input.sdl_id == SDL_BUTTON_LEFT ||
-                k.first.input.sdl_id == SDL_BUTTON_RIGHT) {
+            if (k.first.input.type == InputType::KeyboardMouse &&
+                (k.first.input.sdl_id == SDL_BUTTON_LEFT ||
+                 k.first.input.sdl_id == SDL_BUTTON_RIGHT)) {
                 k.second = true;
             }
         }
@@ -124,21 +140,14 @@ void ApplyMouseInputBlockers() {
 }
 
 Uint32 MousePolling(void* param, Uint32 id, Uint32 interval) {
+    std::scoped_lock lock{mouse_poll_mutex};
     auto* controller = (GameController*)param;
-    switch (mouse_mode) {
-    case MouseMode::Joystick:
+    mouse_input.Tick(SDL_GetTicks());
+    const auto sample = mouse_input.Read();
+    if (sample.mode == MouseMode::Joystick) {
         EmulateJoystick(controller, interval);
-        break;
-    case MouseMode::Gyro:
-        EmulateGyro(controller, interval);
-        break;
-    case MouseMode::Touchpad:
-        EmulateTouchpad(controller, interval);
-        break;
-
-    default:
-        break;
     }
+    controller->SetMouseInput(sample, mouse_gyro_roll_mode);
     return interval;
 }
 

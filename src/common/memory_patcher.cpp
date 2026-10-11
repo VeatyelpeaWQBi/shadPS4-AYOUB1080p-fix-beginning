@@ -250,21 +250,40 @@ static void ApplyBuiltInFixes() {
         std::string_view address; // as in the patch files (executable loaded at 0x400000)
         std::string_view value;
         std::string_view original_hash;
+        std::string_view app_version{}; // empty: retain the original byte-checked version policy
     };
     static constexpr std::array fixes{
         // inFAMOUS Second Son, PS4 Pro mode: its checkerboard rendering shows a green screen,
         // the game renders natively instead (sete r9b -> xor r9d, r9d).
         BuiltInFix{"CUSA00004", "PS4 Pro mode without checkerboard (built in)", "0x005f0cbd",
                    "4531C990", "5c04f08ca74bb842"},
+        // CUSA00309 01.07: verified against the user's dumped executable. The instruction
+        // and its offset match the EU patch; other HK versions are not assumed compatible.
+        BuiltInFix{"CUSA00309", "PS4 Pro mode without checkerboard (HK 01.07, built in)",
+                   "0x005f0cbd", "4531C990", "5c04f08ca74bb842", "01.07"},
     };
+    const auto app_version =
+        Common::Singleton<PSF>::Instance()->GetString("APP_VER").value_or("Unknown version");
     for (const auto& fix : fixes) {
         if (fix.serial != g_game_serial) {
             continue;
         }
-        const auto* current = reinterpret_cast<const unsigned char*>(
-            g_eboot_address + std::stoull(std::string{fix.address}, nullptr, 16) - 0x400000);
+        if (!fix.app_version.empty() && fix.app_version != app_version) {
+            LOG_WARNING(Loader, "Built-in fix {} skipped: APP_VER {} is not {}", fix.name,
+                        app_version, fix.app_version);
+            continue;
+        }
+        const u64 offset = std::stoull(std::string{fix.address}, nullptr, 16) - 0x400000;
+        const size_t patch_size = fix.value.size() / 2;
+        if (g_eboot_address == 0 || offset >= g_eboot_image_size ||
+            patch_size > g_eboot_image_size - offset) {
+            LOG_ERROR(Loader, "Built-in fix {} skipped: address is outside the executable",
+                      fix.name);
+            continue;
+        }
+        const auto* current = reinterpret_cast<const unsigned char*>(g_eboot_address + offset);
         bool already = true;
-        for (size_t i = 0; i < fix.value.size() / 2; ++i) {
+        for (size_t i = 0; i < patch_size; ++i) {
             const auto byte = static_cast<unsigned char>(
                 std::stoul(std::string{fix.value.substr(i * 2, 2)}, nullptr, 16));
             if (current[i] != byte) {

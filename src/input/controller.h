@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <deque>
 #include <mutex>
 #include <optional>
 #include <utility>
@@ -14,6 +15,8 @@
 #include "common/ring_buffer_queue.h"
 #include "core/libraries/pad/pad.h"
 #include "core/libraries/system/userservice.h"
+#include "input/mouse_motion.h"
+#include "input/touchpad_input.h"
 
 namespace Input {
 
@@ -99,6 +102,9 @@ public:
     void UpdateAcceleration(const float acceleration[3]);
     void PollState();
     void ResetOrientation();
+    void SetMouseInput(const MouseSample& sample, bool roll_mode = false);
+    void SetMotionSensorEnabled(bool enabled);
+    void SetAngularVelocityDeadband(bool enabled);
     void SetLightBarRGB(u8 const r, u8 const g, u8 const b);
     void SetLightBarRGB(Colour const c);
     Colour GetLightBarRGB();
@@ -114,6 +120,7 @@ private:
     // m_state_mutex must be held by the caller.
     void PushStateLocked(u64 timestamp = 0);
     void UpdateOrientationLocked(u64 timestamp);
+    State ReportStateLocked(bool advance_touch);
 
     u8 m_next_touch_id{1};
     u64 m_touch_down_timestamp{};
@@ -122,6 +129,14 @@ private:
     std::optional<Colour> override_colour{};
 
     State m_state;
+    MouseMotion m_mouse_motion;
+    MotionReport m_mouse_motion_report;
+    bool m_mouse_motion_active{}, m_mouse_touch_active{}, m_mouse_trigger{};
+    bool m_motion_sensor_enabled{true}, m_angular_velocity_deadband{true};
+    TouchFrame m_mouse_touch, m_last_mouse_touch;
+    std::deque<TouchFrame> m_pending_mouse_touches;
+    u64 m_mouse_touch_start{};
+    u64 m_mouse_motion_log_time{};
 
     std::mutex m_state_mutex;
     RingBufferQueue<State> m_states_queue;

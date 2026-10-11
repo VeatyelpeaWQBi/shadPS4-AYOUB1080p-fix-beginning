@@ -43,6 +43,8 @@
 #define SDL_EVENT_RDOC_CAPTURE SDL_EVENT_USER + 13
 #define SDL_EVENT_SCREENSHOT_WITH_OVERLAYS SDL_EVENT_USER + 14
 #define SDL_EVENT_TOGGLE_FRIENDS SDL_EVENT_USER + 15
+#define SDL_EVENT_CENTER_MOUSE_EMULATION SDL_EVENT_USER + 16
+#define SDL_EVENT_RELEASE_MOUSE_EMULATION SDL_EVENT_USER + 17
 
 #define LEFTJOYSTICK_HALFMODE 0x00010000
 #define RIGHTJOYSTICK_HALFMODE 0x00020000
@@ -67,6 +69,8 @@
 #define HOTKEY_SCREENSHOT_WITH_OVERLAYS 0xf000000e
 #define HOTKEY_OPEN_EMULATOR_SETTINGS 0xf000000f
 #define HOTKEY_TOGGLE_FRIENDS 0xf0000010
+#define HOTKEY_CENTER_MOUSE_EMULATION 0xf0000011
+#define HOTKEY_RELEASE_MOUSE_EMULATION 0xf0000012
 
 #define SDL_UNMAPPED UINT32_MAX - 1
 
@@ -166,6 +170,8 @@ const std::map<std::string, u32> string_to_hotkey_map = {
     {"hotkey_toggle_mouse_to_joystick", HOTKEY_TOGGLE_MOUSE_TO_JOYSTICK},
     {"hotkey_toggle_mouse_to_gyro", HOTKEY_TOGGLE_MOUSE_TO_GYRO},
     {"hotkey_toggle_mouse_to_touchpad", HOTKEY_TOGGLE_MOUSE_TO_TOUCHPAD},
+    {"hotkey_center_mouse_emulation", HOTKEY_CENTER_MOUSE_EMULATION},
+    {"hotkey_release_mouse_emulation", HOTKEY_RELEASE_MOUSE_EMULATION},
     {"hotkey_capture_frame", HOTKEY_RENDERDOC},
     {"hotkey_screenshot_with_overlays", HOTKEY_SCREENSHOT_WITH_OVERLAYS},
     {"hotkey_renderdoc_capture", HOTKEY_RENDERDOC},
@@ -587,6 +593,8 @@ public:
         ControllerOutput(HOTKEY_TOGGLE_MOUSE_TO_JOYSTICK),
         ControllerOutput(HOTKEY_TOGGLE_MOUSE_TO_GYRO),
         ControllerOutput(HOTKEY_TOGGLE_MOUSE_TO_TOUCHPAD),
+        ControllerOutput(HOTKEY_CENTER_MOUSE_EMULATION),
+        ControllerOutput(HOTKEY_RELEASE_MOUSE_EMULATION),
         ControllerOutput(HOTKEY_RENDERDOC),
         ControllerOutput(HOTKEY_SCREENSHOT_WITH_OVERLAYS),
         ControllerOutput(HOTKEY_ADD_VIRTUAL_USER),

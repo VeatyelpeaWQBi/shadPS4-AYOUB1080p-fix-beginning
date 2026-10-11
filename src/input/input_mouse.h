@@ -5,23 +5,23 @@
 
 #include "SDL3/SDL.h"
 #include "common/types.h"
+#include "input/touchpad_input.h"
 
 namespace Input {
 
-enum MouseMode {
-    Off = 0,
-    Joystick,
-    Gyro,
-    Touchpad,
-};
+class GameController;
 
 bool ToggleMouseModeTo(MouseMode m);
 void SetMouseToJoystick(int joystick);
 void SetMouseParams(float mouse_deadzone_offset, float mouse_speed, float mouse_speed_offset);
 void SetMouseGyroRollMode(bool mode);
+MouseMode GetMouseMode();
+MouseInput& GetMouseInput();
+void CenterMouseInput();
+void ReleaseMouseInput(GameController* controller);
+void ProcessMouseEvent(const SDL_Event& event);
 
 void EmulateJoystick(GameController* controller, u32 interval);
-void EmulateGyro(GameController* controller, u32 interval);
 
 void ApplyMouseInputBlockers();
 

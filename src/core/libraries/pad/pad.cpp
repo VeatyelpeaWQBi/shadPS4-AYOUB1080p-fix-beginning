@@ -529,7 +529,11 @@ int PS4_SYSV_ABI scePadSetAngularVelocityBiasCorrectionState() {
 }
 
 int PS4_SYSV_ABI scePadSetAngularVelocityDeadbandState(s32 handle, bool bEnable) {
-    LOG_ERROR(Lib_Pad, "(STUBBED) called");
+    const auto it = handle_to_controller_map.find(handle);
+    if (it == handle_to_controller_map.end()) {
+        return ORBIS_PAD_ERROR_INVALID_HANDLE;
+    }
+    it->second->SetAngularVelocityDeadband(bEnable);
     return ORBIS_OK;
 }
 
@@ -612,10 +616,12 @@ int PS4_SYSV_ABI scePadSetLoginUserNumber() {
 }
 
 int PS4_SYSV_ABI scePadSetMotionSensorState(s32 handle, bool bEnable) {
-    LOG_ERROR(Lib_Pad, "(STUBBED) called");
+    const auto it = handle_to_controller_map.find(handle);
+    if (it == handle_to_controller_map.end()) {
+        return ORBIS_PAD_ERROR_INVALID_HANDLE;
+    }
+    it->second->SetMotionSensorEnabled(bEnable);
     return ORBIS_OK;
-    // it's already handled by the SDL backend and will be on no matter what
-    // (assuming the controller supports it)
 }
 
 int PS4_SYSV_ABI scePadSetProcessFocus() {
