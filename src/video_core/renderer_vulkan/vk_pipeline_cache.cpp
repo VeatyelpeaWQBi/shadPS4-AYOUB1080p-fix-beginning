@@ -2,9 +2,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <condition_variable>
+#include <cstring>
 #include <deque>
+#include <limits>
 #include <mutex>
 #include <ranges>
 #include <thread>
@@ -912,6 +915,7 @@ bool PipelineCache::RefreshGraphicsKey() {
 
 template <typename ProgramRegs>
 Shader::ShaderParams PipelineCache::GetStageParams(const ProgramRegs& pgm) {
+    constexpr size_t HeaderBytes = offsetof(AmdGpu::BinaryInfo, shader_hash) + sizeof(u64);
     if (!Common::Perf::GetTuning().shader_params_memo.load(std::memory_order_relaxed)) {
         return AmdGpu::GetParams(pgm);
     }
@@ -920,8 +924,44 @@ Shader::ShaderParams PipelineCache::GetStageParams(const ProgramRegs& pgm) {
     // Read before the code: a submission or guest wait while reading makes the entry unusable.
     const u64 epoch = VideoCore::CurrentUploadEpoch();
     const u64 host_write_gen = VideoCore::CurrentHostWriteGen();
-    auto& memo = params_memos[(address * 0x9E3779B97F4A7C15ULL) >> (64 - NumParamsMemoBits)];
-    if (memo.address == address && memo.epoch == epoch && memo.host_write_gen == host_write_gen) {
+    const u64 mapping_generation = shader_mapping_generation.load(std::memory_order_acquire);
+    const u32 set_index =
+        (address * 0x9E3779B97F4A7C15ULL) >> (64 - NumParamsMemoBits);
+    auto& set = params_memos[set_index];
+    const auto found = std::ranges::find_if(set, [address](const auto& entry) {
+        return entry.address == address && entry.num_dwords != 0;
+    });
+    const u32 way = found != set.end() ? static_cast<u32>(found - set.begin())
+                                     : params_memo_next[set_index];
+    auto& memo = set[way];
+    params_memo_next[set_index] = (way + 1) % ParamsMemoWays;
+    const bool same_mapping =
+        memo.address == address && memo.mapping_generation == mapping_generation;
+    bool hit = same_mapping && memo.num_dwords != 0 && memo.epoch == epoch &&
+               memo.host_write_gen == host_write_gen;
+    const bool revalidate =
+        Common::Perf::GetTuning().runtime_lookup_memo.load(std::memory_order_relaxed);
+    if (!hit && same_mapping && memo.num_dwords != 0 && revalidate &&
+        memo.scan_input.Size() != 0) {
+        const auto* bytes = reinterpret_cast<const std::byte*>(code);
+        const bool same_scan = memo.scan_input.Matches({bytes, memo.scan_input.Size()});
+        Common::Perf::Add(Common::Perf::ParamsValidationBytes, memo.scan_input.Size());
+        // For a scanned header the snapshot already includes the metadata. A direct header
+        // may lie beyond the bounded search prefix and is checked separately.
+        const bool same_header =
+            same_scan && (!memo.direct_header ||
+                          memo.header_input.Matches({bytes + memo.header_offset,
+                                                     HeaderBytes}));
+        if (same_header && VideoCore::CurrentUploadEpoch() == epoch &&
+            VideoCore::CurrentHostWriteGen() == host_write_gen &&
+            shader_mapping_generation.load(std::memory_order_acquire) == mapping_generation) {
+            hit = true;
+            memo.epoch = epoch;
+            memo.host_write_gen = host_write_gen;
+            Common::Perf::Add(Common::Perf::ParamsMemoRevalidated);
+        }
+    }
+    if (hit) {
         Common::Perf::Add(Common::Perf::ParamsMemoHits);
         return {
             .user_data = pgm.user_data,
@@ -930,14 +970,89 @@ Shader::ShaderParams PipelineCache::GetStageParams(const ProgramRegs& pgm) {
         };
     }
     Common::Perf::Add(Common::Perf::ParamsMemoMisses);
-    const auto params = AmdGpu::GetParams(pgm);
-    memo = ParamsMemo{
-        .address = address,
-        .epoch = epoch,
-        .host_write_gen = host_write_gen,
-        .hash = params.hash,
-        .num_dwords = static_cast<u32>(params.code.size()),
+    Common::Perf::Add(Common::Perf::ParamsHeaderScans);
+    const auto& header = AmdGpu::SearchBinaryInfo(code);
+    // Only snapshot fields read by GetParams; CRC and trailing ABI padding are not needed.
+    AmdGpu::BinaryInfo header_copy{};
+    std::memcpy(&header_copy, &header, HeaderBytes);
+    const u32 num_dwords = header_copy.length / sizeof(u32);
+    const u64 shader_hash = header_copy.shader_hash;
+    const auto header_snapshot = std::as_bytes(std::span{&header_copy, 1}).first(HeaderBytes);
+    const Shader::ShaderParams params{
+        .user_data = pgm.user_data,
+        .code = std::span<const u32>{code, num_dwords},
+        .hash = shader_hash,
     };
+    memo.address = address;
+    memo.epoch = epoch;
+    memo.host_write_gen = host_write_gen;
+    memo.mapping_generation = mapping_generation;
+    memo.hash = params.hash;
+    memo.num_dwords = static_cast<u32>(params.code.size());
+    memo.scan_input.Invalidate();
+    memo.header_input.Invalidate();
+    if (revalidate) {
+        const auto* bytes = reinterpret_cast<const std::byte*>(code);
+        const auto* header_bytes = reinterpret_cast<const std::byte*>(&header);
+        const size_t header_offset = header_bytes - bytes;
+        std::array<u32, 2> code_start;
+        std::memcpy(code_start.data(), code, sizeof(code_start));
+        memo.direct_header = code_start[0] == 0xBEEB03FF &&
+                             &header == std::bit_cast<const AmdGpu::BinaryInfo*>(
+                                            code + (code_start[1] + 1) * 2);
+        // SearchBinaryInfo's fallback examines at most 0x4000 words. Larger direct
+        // offsets are valid, but cannot be narrowed into the stored byte offset.
+        if (header_offset <= std::numeric_limits<u32>::max()) {
+            memo.header_offset = static_cast<u32>(header_offset);
+            if (memo.direct_header) {
+                memo.scan_input.Capture(std::as_bytes(std::span{code_start}));
+                memo.header_input.Capture(header_snapshot);
+            } else {
+                const size_t scan_size = header_offset + HeaderBytes;
+                if (memo.scan_input.Capture({bytes, scan_size})) {
+                    // Verify the owned copy still selects the same first header. A guest
+                    // mutation while it was copied must not cache a different scan's result.
+                    const auto snapshot = memo.scan_input.Data();
+                    const auto signature_at = [&](size_t offset) {
+                        return offset + AmdGpu::BinaryInfo::signature_ref.size() <= snapshot.size() &&
+                               std::memcmp(snapshot.data() + offset,
+                                           AmdGpu::BinaryInfo::signature_ref.data(),
+                                           AmdGpu::BinaryInfo::signature_ref.size()) == 0;
+                    };
+                    bool valid = true;
+                    u32 token, immediate;
+                    std::memcpy(&token, snapshot.data(), sizeof(token));
+                    std::memcpy(&immediate, snapshot.data() + sizeof(u32), sizeof(immediate));
+                    if (token == 0xBEEB03FF) {
+                        const u64 direct_offset = u64{u32{immediate + 1}} * 2 * sizeof(u32);
+                        valid = direct_offset <= snapshot.size() - HeaderBytes;
+                        if (valid && signature_at(direct_offset)) {
+                            valid = direct_offset == header_offset;
+                        }
+                    }
+                    for (size_t offset = 0; valid && offset < header_offset; offset += sizeof(u32)) {
+                        valid = !signature_at(offset);
+                    }
+                    if (!valid || std::memcmp(snapshot.data() + header_offset, header_snapshot.data(),
+                                              HeaderBytes) != 0) {
+                        memo.scan_input.Invalidate();
+                    }
+                }
+            }
+            if (header.length / sizeof(u32) != num_dwords || header.shader_hash != shader_hash) {
+                memo.scan_input.Invalidate();
+                memo.header_input.Invalidate();
+            }
+        }
+        // A wait/readback while reading may have changed guest memory. Keep the original
+        // epoch (so the next lookup misses), and never carry that snapshot across epochs.
+        if (VideoCore::CurrentUploadEpoch() != epoch ||
+            VideoCore::CurrentHostWriteGen() != host_write_gen ||
+            shader_mapping_generation.load(std::memory_order_acquire) != mapping_generation) {
+            memo.scan_input.Invalidate();
+            memo.header_input.Invalidate();
+        }
+    }
     return params;
 }
 
@@ -1174,9 +1289,8 @@ namespace {
 /// bindings. Addresses and sizes are left out, so that a shader bound with other buffers and
 /// textures of the same layout finds its permutation.
 template <typename InfoT>
-u64 SpecializationKey(const InfoT& info, const Shader::RuntimeInfo& runtime_info,
-                      const Shader::Backend::Bindings& binding) {
-    boost::container::small_vector<u32, 160> words;
+void SpecializationInputs(const InfoT& info, const Shader::Backend::Bindings& binding,
+                          boost::container::small_vector<u32, 160>& words) {
     words.push_back(binding.unified);
     words.push_back(binding.buffer);
     if (info.has_fetch_shader) {
@@ -1217,9 +1331,15 @@ u64 SpecializationKey(const InfoT& info, const Shader::RuntimeInfo& runtime_info
         const auto sharp = desc.GetSharp(info);
         words.push_back(static_cast<u32>(sharp.raw0 & ((1u << 15) | (1u << 20))));
     }
-    u64 key = XXH3_64bits(words.data(), words.size() * sizeof(u32));
-    key = HashCombine(key, XXH3_64bits(&runtime_info, sizeof(runtime_info)));
-    return key;
+}
+
+template <typename InfoT>
+u64 SpecializationKey(const InfoT& info, const Shader::RuntimeInfo& runtime_info,
+                      const Shader::Backend::Bindings& binding) {
+    boost::container::small_vector<u32, 160> words;
+    SpecializationInputs(info, binding, words);
+    return HashCombine(XXH3_64bits(words.data(), words.size() * sizeof(u32)),
+                       XXH3_64bits(&runtime_info, sizeof(runtime_info)));
 }
 
 /// Whether the vertex attributes of the permutation (from its fetch shader) are specialized
@@ -1349,10 +1469,47 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     const bool memoize = Common::Perf::GetTuning().spec_memo.load(std::memory_order_relaxed) &&
                          sw_stage != SwStage::TessellationControl &&
                          sw_stage != SwStage::TessellationEval;
+    const bool exact_memo = memoize && scouted == nullptr &&
+                            Common::Perf::GetTuning().runtime_lookup_memo.load(
+                                std::memory_order_relaxed);
+    boost::container::small_vector<u32, 160> selection_words;
+    const auto runtime_bytes = std::as_bytes(std::span{&runtime_info, 1});
+    if (exact_memo) {
+        SpecializationInputs(info, binding, selection_words);
+        const auto input_bytes = std::as_bytes(
+            std::span<const u32>{selection_words.data(), selection_words.size()});
+        const u32 perm = program->selection_perm;
+        if (program->selection_inputs.Matches(input_bytes) &&
+            program->selection_runtime.Matches(runtime_bytes) && perm < program->modules.size() &&
+            program->modules[perm].module &&
+            VertexAttributesMatch(info, runtime_info, program->modules[perm].spec)) {
+            Common::Perf::Add(Common::Perf::SelectionMemoHits);
+            Common::Perf::Add(Common::Perf::SpecMemoHits);
+            info.AddBindings(binding);
+            auto& module = program->modules[perm];
+            if (!module.spec.fetch_shader_data.Empty()) {
+                fetch_shader = &module.spec.fetch_shader_data;
+            }
+            return std::make_tuple(&info, module.module, HashCombine(params.hash, u64{perm}));
+        }
+        Common::Perf::Add(Common::Perf::SelectionMemoMisses);
+    }
+    const auto remember_selection = [&](u32 perm) {
+        if (exact_memo) {
+            program->selection_inputs.Capture(std::as_bytes(
+                std::span<const u32>{selection_words.data(), selection_words.size()}));
+            program->selection_runtime.Capture(runtime_bytes);
+            program->selection_perm = perm;
+        }
+    };
     u64 memo_key = 0;
     if (memoize) {
         memo_key = scouted != nullptr ? scouted->memo_key
-                                      : SpecializationKey(info, runtime_info, binding);
+                   : exact_memo ? HashCombine(
+                                      XXH3_64bits(selection_words.data(),
+                                                   selection_words.size() * sizeof(u32)),
+                                      XXH3_64bits(&runtime_info, sizeof(runtime_info)))
+                                : SpecializationKey(info, runtime_info, binding);
         for (const auto& entry : program->memo) {
             // The command processor is the only writer: plain (relaxed) reads.
             const u32 entry_perm = entry.perm_idx.load(std::memory_order_relaxed);
@@ -1363,6 +1520,7 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
                 Common::Perf::Add(Common::Perf::SpecMemoHits);
                 info.AddBindings(binding);
                 auto& perm = program->modules[entry_perm];
+                remember_selection(entry_perm);
                 if (auto& fetch = perm.spec.fetch_shader_data; !fetch.Empty()) {
                     fetch_shader = &fetch;
                 }
@@ -1397,6 +1555,7 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     if (memoize) {
         program->WriteMemo(memo_key, static_cast<u32>(perm_idx));
     }
+    remember_selection(static_cast<u32>(perm_idx));
     if (auto& fetch = program->modules[perm_idx].spec.fetch_shader_data; !fetch.Empty()) {
         fetch_shader = &fetch;
     }

@@ -68,6 +68,7 @@ void ApplyGameProfile(std::string_view serial) {
     t.async_written_uploads.store(true, relaxed);
     t.skip_redundant_binds.store(true, relaxed);
     t.shader_params_memo.store(true, relaxed);
+    t.runtime_lookup_memo.store(serial == "CUSA00309", relaxed);
     t.skip_empty_draws.store(true, relaxed);
     t.pipeline_key_memo.store(true, relaxed);
     t.bind_prefetch.store(true, relaxed);
@@ -155,6 +156,8 @@ void PollTuning() {
             tuning.skip_redundant_binds.store(value != "0", std::memory_order_relaxed);
         } else if (key == "shader_params_memo") {
             tuning.shader_params_memo.store(value != "0", std::memory_order_relaxed);
+        } else if (key == "runtime_lookup_memo") {
+            tuning.runtime_lookup_memo.store(value != "0", std::memory_order_relaxed);
         } else if (key == "skip_empty_draws") {
             tuning.skip_empty_draws.store(value != "0", std::memory_order_relaxed);
         } else if (key == "scout_fast") {
@@ -421,7 +424,7 @@ void PollTuning() {
              "cpu_affinity={:#x} scout_fast={} pipeline_key_memo={} bind_prefetch={} "
              "gpu_threads_affinity={:#x} other_threads_affinity={:#x} rt_memo={} "
              "late_protect={} parallel_protect={} gpu_threads_priority={} gpu_profile={} "
-             "readback_relaxed_sites={} asc_queue={}",
+             "readback_relaxed_sites={} asc_queue={} runtime_lookup_memo={}",
              tuning.readback_window_bytes.load(std::memory_order_relaxed) / 1024,
              tuning.readback_write_discard.load(std::memory_order_relaxed),
              tuning.readback_write_merge.load(std::memory_order_relaxed),
@@ -485,7 +488,8 @@ void PollTuning() {
                  }
                  return sites.empty() ? std::string{"none"} : sites;
              }(),
-             tuning.asc_queue.load(std::memory_order_relaxed));
+             tuning.asc_queue.load(std::memory_order_relaxed),
+             tuning.runtime_lookup_memo.load(std::memory_order_relaxed));
 }
 
 namespace {

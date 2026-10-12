@@ -194,6 +194,7 @@ bool StreamBuffer::PrepareMap(u64 size, u64 alignment, bool allow_wait) {
     }
 
     if (offset + size > this->size_bytes) {
+        ++allocation_generation;
         // The buffer would overflow, save the amount of used watches and reset the state.
         invalidation_mark = current_watch_cursor;
         current_watch_cursor = 0;
@@ -211,6 +212,41 @@ bool StreamBuffer::PrepareMap(u64 size, u64 alignment, bool allow_wait) {
 
     mapped_size = size;
     return true;
+}
+
+bool StreamBuffer::WouldWrap(u64 size, u64 alignment) const {
+    if (!mapped_data.empty() && !is_coherent) {
+        size = Common::AlignUp(size, non_coherent_atom_size);
+        alignment = alignment > 0 ? std::lcm(alignment, non_coherent_atom_size)
+                                 : non_coherent_atom_size;
+    }
+    const u64 start = alignment > 0 ? Common::AlignUp(offset, alignment) : offset;
+    return start > size_bytes || size > size_bytes - start;
+}
+
+bool StreamBuffer::MayFlushOnMap(u64 size, u64 alignment) const {
+    if (WouldWrap(size, alignment)) {
+        return true;
+    }
+    if (!invalidation_mark) {
+        return false;
+    }
+    if (!mapped_data.empty() && !is_coherent) {
+        size = Common::AlignUp(size, non_coherent_atom_size);
+        alignment = alignment > 0 ? std::lcm(alignment, non_coherent_atom_size)
+                                 : non_coherent_atom_size;
+    }
+    const u64 requested_end =
+        (alignment > 0 ? Common::AlignUp(offset, alignment) : offset) + size;
+    u64 bound = wait_bound;
+    for (size_t i = wait_cursor; requested_end > bound && i < *invalidation_mark; ++i) {
+        const auto& watch = previous_watches[i];
+        if (watch.tick >= scheduler.CurrentTick()) {
+            return true;
+        }
+        bound = watch.upper_bound;
+    }
+    return false;
 }
 
 std::pair<u8*, u64> StreamBuffer::Map(u64 size, u64 alignment, bool allow_wait) {

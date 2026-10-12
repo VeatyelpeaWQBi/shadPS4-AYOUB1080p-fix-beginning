@@ -275,6 +275,9 @@ private:
     void TraceBufferWriters(const Shader::Info& stage);
     void BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                      Shader::PushData& push_data);
+    /// Finish immutable table uploads after vertex/index preparation, immediately before
+    /// recording descriptors. This prevents a later ring wrap from overwriting reused data.
+    void FinalizeFlatbufUploads();
     void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding);
     bool BindResources(const Pipeline* pipeline);
 
@@ -443,6 +446,17 @@ private:
     u32 set_write_index{};
     Pipeline::DescriptorWrites set_writes;
     Shader::PushData push_data;
+
+    /// Immutable flattened resource tables uploaded in the current stream submission.
+    /// Contents are compared on every use; bounded to 64 * 4 KiB, command processor only.
+    std::array<VideoCore::RuntimeUploadMemo<4096>, 64> flatbuf_upload_memos;
+    struct PendingFlatbuf {
+        std::span<const u32> data;
+        u32 buffer_info;
+        u32 memo_index;
+        bool reusable;
+    };
+    boost::container::static_vector<PendingFlatbuf, Shader::NUM_BUFFERS> pending_flatbufs;
 
     using ImageBindingInfo = std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc>;
     boost::container::static_vector<ImageBindingInfo, Shader::NUM_IMAGES> image_bindings;

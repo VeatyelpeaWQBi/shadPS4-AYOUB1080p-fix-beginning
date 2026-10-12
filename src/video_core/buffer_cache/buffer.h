@@ -147,6 +147,19 @@ struct StreamBuffer : public Buffer {
         return last_tick;
     }
 
+    /// Changes whenever the ring wraps. Even an allocation in the same tick can otherwise
+    /// overwrite the bytes remembered by an upload memo after a scheduler wait.
+    [[nodiscard]] u64 AllocationGeneration() const noexcept {
+        return allocation_generation;
+    }
+
+    /// Predict the same alignment/wrap as Map, without advancing the allocation cursor.
+    [[nodiscard]] bool WouldWrap(u64 size, u64 alignment = 0) const;
+
+    /// Whether reserving this much space could submit the current command buffer to wait
+    /// for its own allocations. Used before recording vertex/index state, never afterwards.
+    [[nodiscard]] bool MayFlushOnMap(u64 size, u64 alignment = 0) const;
+
     /// Maps and commits a memory region with user provided data
     u64 Copy(auto src, size_t size, size_t alignment = 0) {
         const auto [data, offset] = Map(size, alignment);
@@ -181,6 +194,7 @@ private:
     u64 offset{};
     u64 mapped_size{};
     u64 last_tick{};
+    u64 allocation_generation{1};
     std::vector<Watch> current_watches;
     std::size_t current_watch_cursor{};
     std::optional<size_t> invalidation_mark;

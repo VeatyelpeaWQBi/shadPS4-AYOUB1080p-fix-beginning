@@ -861,6 +861,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         runtime.FlushBarriers();
     }
 
+    FinalizeFlatbufUploads();
     pipeline->BindResources(set_writes, push_data);
     UpdateDynamicState(pipeline, is_indexed);
     scheduler.BeginRendering(state);
@@ -977,6 +978,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         runtime.FlushBarriers();
     }
 
+    FinalizeFlatbufUploads();
     pipeline->BindResources(set_writes, push_data);
     UpdateDynamicState(pipeline, is_indexed);
     scheduler.BeginRendering(state);
@@ -1062,6 +1064,7 @@ void Rasterizer::DispatchDirect() {
     if (!on_compute_queue) {
         scheduler.EndRendering();
     }
+    FinalizeFlatbufUploads();
     pipeline->BindResources(Sched(), set_writes, push_data);
 
     const auto cmdbuf = Sched().Recorder();
@@ -1120,6 +1123,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     if (!on_compute_queue) {
         scheduler.EndRendering();
     }
+    FinalizeFlatbufUploads();
     pipeline->BindResources(Sched(), set_writes, push_data);
 
     const auto cmdbuf = Sched().Recorder();
@@ -1286,6 +1290,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     set_writes.clear();
     buffer_infos.clear();
     image_infos.clear();
+    pending_flatbufs.clear();
 
     bool uses_dma = false;
 
@@ -1305,6 +1310,18 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
 
     if (uses_dma) {
         buffer_cache.SynchronizeDmaBuffers();
+    }
+
+    if (!pending_flatbufs.empty() &&
+        buffer_cache.GetStreamBuffer().MayFlushOnMap(4_MB, instance.StorageMinAlignment())) {
+        // Leave conservative room for the remaining vertex/index/small-image preparations
+        // (streamed guest buffers are at most 16 KiB, tables here at most 4 KiB each).
+        // Near a wrap or a wait on this tick, use fresh uploads now, as in the old order.
+        // Uploading later must not submit and lose already recorded vertex/index bindings.
+        for (auto& pending : pending_flatbufs) {
+            pending.reusable = false;
+        }
+        FinalizeFlatbufUploads();
     }
 
     return true;
@@ -1811,9 +1828,24 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             } else if (desc.buffer_type == Shader::BufferType::Flatbuf) {
                 auto& vk_buffer = buffer_cache.GetStreamBuffer();
                 const u32 ubo_size = stage.flattened_ud_buf.size() * sizeof(u32);
-                const u64 offset =
-                    vk_buffer.Copy(stage.flattened_ud_buf.data(), ubo_size, alignment);
-                buffer_infos.emplace_back(vk_buffer.Handle(), offset, ubo_size);
+                if (Common::Perf::GetTuning().runtime_lookup_memo.load(std::memory_order_relaxed) &&
+                    !Common::Perf::FrameDumpActive().load(std::memory_order_relaxed) &&
+                    ubo_size <= 4096) {
+                    pending_flatbufs.push_back(PendingFlatbuf{
+                        .data = stage.flattened_ud_buf,
+                        .buffer_info = static_cast<u32>(buffer_infos.size()),
+                        .memo_index = static_cast<u32>(
+                            (stage.pgm_hash * 0x9E3779B97F4A7C15ULL) >> (64 - 6)),
+                        .reusable = !desc.is_written,
+                    });
+                    // FinalizeFlatbufUploads fills the offset before these descriptors are
+                    // recorded; other bindings may wrap the stream in the meantime.
+                    buffer_infos.emplace_back(vk_buffer.Handle(), 0, ubo_size);
+                } else {
+                    const u64 offset =
+                        vk_buffer.Copy(stage.flattened_ud_buf.data(), ubo_size, alignment);
+                    buffer_infos.emplace_back(vk_buffer.Handle(), offset, ubo_size);
+                }
             } else if (desc.buffer_type == Shader::BufferType::ClipPlanes) {
                 // Permutations compiled without enabled planes never read the buffer, so the
                 // declared binding is satisfied with a null descriptor instead of a copy.
@@ -1898,6 +1930,73 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
         set_write.pBufferInfo = &buffer_infos.back();
         ++binding.buffer;
     }
+}
+
+void Rasterizer::FinalizeFlatbufUploads() {
+    if (pending_flatbufs.empty()) {
+        return;
+    }
+    auto& stream = buffer_cache.GetStreamBuffer();
+    const u64 alignment = instance.StorageMinAlignment();
+    const u64 tick = Sched().CurrentTick();
+    const u64 generation = stream.AllocationGeneration();
+    std::array<bool, Shader::NUM_BUFFERS> hits{};
+    std::array<u64, Shader::NUM_BUFFERS> offsets{};
+    u64 upload_size = 0;
+    for (size_t i = 0; i < pending_flatbufs.size(); ++i) {
+        const auto& pending = pending_flatbufs[i];
+        auto& memo = flatbuf_upload_memos[pending.memo_index];
+        hits[i] = pending.reusable &&
+                  memo.Matches(std::as_bytes(pending.data), &stream, tick, generation);
+        if (hits[i]) {
+            offsets[i] = memo.Offset();
+        } else {
+            upload_size = Common::AlignUp(upload_size, alignment);
+            offsets[i] = upload_size;
+            upload_size += pending.data.size_bytes();
+        }
+    }
+    if (upload_size != 0 && stream.WouldWrap(upload_size, alignment)) {
+        // A wrap invalidates every reused offset. Put all tables in one fresh allocation,
+        // so uploading a later table cannot overwrite a table prepared for this draw.
+        upload_size = 0;
+        for (size_t i = 0; i < pending_flatbufs.size(); ++i) {
+            hits[i] = false;
+            upload_size = Common::AlignUp(upload_size, alignment);
+            offsets[i] = upload_size;
+            upload_size += pending_flatbufs[i].data.size_bytes();
+        }
+    }
+    u64 base_offset = 0;
+    if (upload_size != 0) {
+        const auto [destination, offset] = stream.Map(upload_size, alignment);
+        ASSERT_MSG(destination, "Failed to upload shader tables ({:#x} bytes)", upload_size);
+        base_offset = offset;
+        for (size_t i = 0; i < pending_flatbufs.size(); ++i) {
+            if (!hits[i]) {
+                const auto data = std::as_bytes(pending_flatbufs[i].data);
+                std::memcpy(destination + offsets[i], data.data(), data.size());
+            }
+        }
+        stream.Commit();
+    }
+    for (size_t i = 0; i < pending_flatbufs.size(); ++i) {
+        const auto& pending = pending_flatbufs[i];
+        const auto data = std::as_bytes(pending.data);
+        if (hits[i]) {
+            Common::Perf::Add(Common::Perf::FlatbufMemoHits);
+            Common::Perf::Add(Common::Perf::FlatbufMemoSavedBytes, data.size());
+        } else {
+            offsets[i] += base_offset;
+            Common::Perf::Add(Common::Perf::FlatbufMemoMisses);
+            if (pending.reusable) {
+                flatbuf_upload_memos[pending.memo_index].Capture(
+                    data, &stream, Sched().CurrentTick(), stream.AllocationGeneration(), offsets[i]);
+            }
+        }
+        buffer_infos[pending.buffer_info].offset = offsets[i];
+    }
+    pending_flatbufs.clear();
 }
 
 void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
@@ -2691,6 +2790,7 @@ bool Rasterizer::IsMapped(VAddr addr, u64 size) {
 }
 
 void Rasterizer::MapMemory(VAddr addr, u64 size) {
+    pipeline_cache.NotifyMemoryMapChanged();
     {
         std::scoped_lock lock{mapped_ranges_mutex};
         mapped_ranges += decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);
@@ -2702,6 +2802,7 @@ void Rasterizer::RegisterMemory(VAddr addr, u64 size) {
 }
 
 void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
+    pipeline_cache.NotifyMemoryMapChanged();
     buffer_cache.InvalidateMemory(addr, size);
     texture_cache.UnmapMemory(addr, size);
     {

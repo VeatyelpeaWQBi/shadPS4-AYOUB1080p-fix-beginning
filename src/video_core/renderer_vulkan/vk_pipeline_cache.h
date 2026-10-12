@@ -10,6 +10,8 @@
 #include <unordered_set>
 #include <xxhash.h>
 #include "video_core/amdgpu/scout.h"
+#include "video_core/amdgpu/regs_shader.h"
+#include "video_core/runtime_memo.h"
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/recompiler.h"
 #include "shader_recompiler/specialization.h"
@@ -90,6 +92,12 @@ struct Program {
     std::array<MemoEntry, NumMemoEntries> memo{};
     u32 memo_next{}; ///< Command processor only.
 
+    /// Exact inputs and last selection; never accessed by the scout/compiler threads.
+    /// Vertex attribute descriptors are additionally checked at every use.
+    VideoCore::RuntimeSnapshot<4096> selection_inputs;
+    VideoCore::RuntimeSnapshot<sizeof(Shader::RuntimeInfo)> selection_runtime;
+    u32 selection_perm{};
+
     /// Command processor: remembers the permutation of a key (oldest entry replaced).
     void WriteMemo(u64 key, u32 perm_idx) noexcept {
         auto& entry = memo[memo_next];
@@ -161,6 +169,12 @@ public:
 
     void WarmUp();
     void Sync();
+
+    /// Map/unmap can reuse a shader address with a shorter allocation. Forget old scan ranges
+    /// before examining them, independently of uploads and writes (called by memory threads).
+    void NotifyMemoryMapChanged() noexcept {
+        shader_mapping_generation.fetch_add(1, std::memory_order_acq_rel);
+    }
 
     bool LoadComputePipeline(Serialization::Archive& ar);
     bool LoadGraphicsPipeline(Serialization::Archive& ar);
@@ -261,20 +275,27 @@ private:
     tsl::robin_map<ComputePipelineKey, std::unique_ptr<ComputePipeline>> compute_pipelines;
     tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>> graphics_pipelines;
     std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
-    /// Shader params memo (shader_params_memo): the code size and hash found for a shader
-    /// address, reused while the upload epoch and the emulator write generation stay the same.
-    /// Until then there was no new submission or guest wait, so the guest cannot have written
-    /// other code at that address for the commands being processed. Reading the code start and
-    /// its binary info at the end of the code missed the caches twice per stage of every draw.
+    /// Epoch-local shader params, optionally revalidated against owned metadata/scan inputs
+    /// across epochs. A scanned header snapshots the entire searched prefix, so an earlier
+    /// header inserted at the same address cannot be missed. Direct headers need only the
+    /// first two words and their metadata. At most 256 * (64 KiB + two headers) of snapshots.
     struct ParamsMemo {
         VAddr address{};
         u64 epoch{};
         u64 host_write_gen{};
+        u64 mapping_generation{};
         u64 hash{};
         u32 num_dwords{};
+        u32 header_offset{};
+        bool direct_header{};
+        VideoCore::RuntimeSnapshot<64 * 1024 + sizeof(AmdGpu::BinaryInfo)> scan_input;
+        VideoCore::RuntimeSnapshot<sizeof(AmdGpu::BinaryInfo)> header_input;
     };
     static constexpr u32 NumParamsMemoBits = 6;
-    std::array<ParamsMemo, 1U << NumParamsMemoBits> params_memos{};
+    static constexpr u32 ParamsMemoWays = 4;
+    std::array<std::array<ParamsMemo, ParamsMemoWays>, 1U << NumParamsMemoBits> params_memos{};
+    std::array<u8, 1U << NumParamsMemoBits> params_memo_next{};
+    std::atomic<u64> shader_mapping_generation{1};
     /// Pipeline key memo (pipeline_key_memo): the key and pipeline of the last draw.
     GraphicsPipelineKey last_graphics_key{};
     GraphicsPipeline* last_graphics_pipeline{};

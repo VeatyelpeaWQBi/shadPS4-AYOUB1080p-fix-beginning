@@ -269,6 +269,16 @@ enum Counter : u32 {
     CrossWaitsCompute,
     CrossQueueFlushes,
     CrossQueueFirstTouches,
+    // Exact runtime snapshots: successful cross-epoch params checks, full scans, bytes checked;
+    // repeated specialization selections, and immutable flat-buffer uploads reused/copied.
+    ParamsMemoRevalidated,
+    ParamsHeaderScans,
+    ParamsValidationBytes,
+    SelectionMemoHits,
+    SelectionMemoMisses,
+    FlatbufMemoHits,
+    FlatbufMemoMisses,
+    FlatbufMemoSavedBytes,
     CounterCount,
 };
 
@@ -484,6 +494,9 @@ struct Tuning {
     /// The code size and hash of a shader address are reused until the next submission or guest
     /// wait, instead of being read in guest memory for every stage of every draw.
     std::atomic<bool> shader_params_memo{false};
+    /// Revalidate shader metadata across epochs and reuse exact specialization/upload inputs.
+    /// Enabled automatically for tested CUSA00309; other games/regions remain opt-in.
+    std::atomic<bool> runtime_lookup_memo{false};
     /// Draws without vertices and dispatches without workgroups are left out before their
     /// pipeline and resources are looked up.
     std::atomic<bool> skip_empty_draws{false};
@@ -734,7 +747,9 @@ inline void OnFlip(float draws_per_frame, float dispatches_per_frame) {
              "{:.0f}% submissions {} ({:.2f} ms avg, in flight {:.1f} avg) with readbacks {} "
              "({:.2f} ms avg) compute {} ({:.1f} ms) | relaxed readbacks {} (pages refreshed {} "
              "left {}) | asc queue dispatches {} fallbacks {} submits {} waits gfx {} compute {} "
-             "flushes {} first touches {} | draws/frame {:.0f} dispatches/frame {:.0f}",
+             "flushes {} first touches {} | draws/frame {:.0f} dispatches/frame {:.0f} | "
+             "runtime memo: params revalidated {} scans {} checked {:.2f} MB selection {}/{} "
+             "flat uploads {}/{} saved {:.2f} MB",
              static_cast<double>(r.frames) / seconds,
              r.frames ? r.frame_ms_sum / static_cast<double>(r.frames) : 0.0, r.frame_ms_max,
              r.frames_over_33, r.frames_over_50, pct(t[GpuBusyNs]), pct(t[GpuSpinNs]),
@@ -801,7 +816,9 @@ inline void OnFlip(float draws_per_frame, float dispatches_per_frame) {
              t[ReadbackRelaxedRefreshes], t[ReadbackRelaxedSkips], t[AscQueueDispatches],
              t[AscQueueFallbacks], t[ComputeQueueSubmits], t[CrossWaitsGraphics],
              t[CrossWaitsCompute], t[CrossQueueFlushes], t[CrossQueueFirstTouches],
-             draws_per_frame, dispatches_per_frame);
+             draws_per_frame, dispatches_per_frame, t[ParamsMemoRevalidated], t[ParamsHeaderScans],
+             mb(t[ParamsValidationBytes]), t[SelectionMemoHits], t[SelectionMemoMisses],
+             t[FlatbufMemoHits], t[FlatbufMemoMisses], mb(t[FlatbufMemoSavedBytes]));
 
     const u64 last_flip = r.last_flip;
     const u64 flip_index = r.flip_index;
