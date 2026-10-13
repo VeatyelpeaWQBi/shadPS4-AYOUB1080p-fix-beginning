@@ -141,6 +141,11 @@ The script reuses installed tools and existing dependencies without downloading 
 
 ### HK controls and validation
 
+Double-click `scripts\launch_infamous_1080p.bat` or `scripts\launch_infamous_4k_pro.bat`
+to launch the local Release build. The corresponding `_debug.bat` files enable performance
+diagnostics. Keep the console open until the game exits and the previous settings are restored.
+All four launchers use the local build and the configured `GAME_DIR`; edit that variable if needed.
+
 - F6 toggles mouse motion; move to change orientation, move back and forth to shake, and hold
   the left button to spray (R2).
 - Delete toggles touchpad emulation. Left/right mouse buttons produce contacts; holding both
