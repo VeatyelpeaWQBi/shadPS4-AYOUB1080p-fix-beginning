@@ -67,6 +67,42 @@ FNV-1a 校验，因此这份港版程序可沿用这些地址和修改值。这�
 .\scripts\run_infamous_hk.ps1 -Resolution 4k
 ```
 
+### 本机 BAT 性能对照启动
+
+当前 BAT 使用本项目 `Build\x64-Clang-Release\shadps4.exe` 和
+`D:\game\shadPS4QtLauncher\games\CUSA00309` 时，可直接双击：
+
+- `scripts/launch_infamous_1080p.bat`：基础 PS4 模式、原生 1920×1080，关闭所有升分辨率补丁。
+- `scripts/launch_infamous_4k_pro.bat`：PS4 Pro 模式、原生 3840×2160，启用 Pro 4K 补丁，
+  关闭棋盘格及其他分辨率补丁，保留扩大灯光列表的补丁。
+
+两者使用同一组既有 inFAMOUS 优化和 `-Performance` 配置：开场栈保护、精确回读、
+异步回读与上传、线程化记录、图形管线异步编译及管线缓存。新构建并行创建计算管线，
+在执行对应任务前等待编译完成，保留所有计算任务。
+自动优先选择支持所需 Vulkan 版本的独立显卡，使用无边框全屏、60 Hz 游戏时钟和 FPS
+显示，关闭 FSR、诊断采样、调试导出、RenderDoc 与 Vulkan 验证层；日志仅保留
+error/critical，异步写入，上限 16 MiB。
+
+BAT 应留在本项目的 `scripts` 目录中，依赖同目录的 `run_infamous_hk.ps1` 和项目中的
+港版配置、XML 补丁及 tuning 文本。使用系统 Windows PowerShell；执行策略 Bypass
+仅作用于本次 PowerShell 进程。无需重新构建模拟器，也不安装工具或修改系统设置。
+`-Performance` 不能与 `-Diagnostic` 或 `-SynchronousReadbacks` 同时使用。
+
+每次只启动一个脚本，保留命令窗口，正常关闭游戏并等到显示配置已恢复后再切换另一模式。
+两个模式复用相同的用户目录、存档、输入设置和现有缓存，不改动游戏文件。
+请在相同存档和场景下比较，记录首次进入与重复进入后的帧率和卡顿差异。
+1080p 已进行用户游玩和隔离存档测试；本轮没有验证 PS4 Pro 原生 4K 的图像与性能。
+
+性能诊断版为 `launch_infamous_1080p_debug.bat` 和 `launch_infamous_4k_pro_debug.bat`，
+使用同一 EXE 和优化，增加 CPU/GPU 采样及退出后的独立报告。
+使用方法、当前三次停顿的证据和下一轮测试重点见 [性能诊断说明](infamous-performance-diagnostics.md)。
+
+### 缓存和预热改造
+
+后台持久化、计算/图形管线启动预热、驱动缓存和自动内存预算，以及两轮对照命令，
+见 [缓存与预热说明](infamous-cache-prewarm.md)。需要新的构建才能生效；
+`-Performance -CacheDiagnostic` 可保留简要缓存和慢帧日志，用于比较复用效果。
+
 脚本先核对游戏程序完整 SHA-256，然后只临时调整以下三个文件：
 
 - 用户目录的 `custom_configs/CUSA00309.json`；

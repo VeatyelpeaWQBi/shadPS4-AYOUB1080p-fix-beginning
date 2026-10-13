@@ -6,6 +6,7 @@
 #include "common/interval_set.h"
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
+#include "video_core/buffer_access_tracker.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/texture_cache/image.h"
 #include "video_core/texture_cache/types.h"
@@ -82,21 +83,13 @@ public:
     void FlushBarriers();
 
 private:
-    void MakeCurrent(const VideoCore::Buffer* handle);
 
 private:
     const Instance& instance;
     Scheduler& scheduler;
     std::unique_ptr<VideoCore::BlitHelper> blit_helper;
     StagingBufferPool staging_pool;
-    struct BufferBarriers {
-        const VideoCore::Buffer* handle;
-        using AccessList = IntervalList<Interval>;
-        AccessList read_ranges;
-        AccessList write_ranges;
-    };
-    BufferBarriers* resource{};
-    std::vector<BufferBarriers> resources;
+    VideoCore::BufferAccessTracker<const VideoCore::Buffer*> buffer_access;
     VideoCore::Image::Barriers image_barriers;
     vk::MemoryBarrier2 memory_barrier{};
 };

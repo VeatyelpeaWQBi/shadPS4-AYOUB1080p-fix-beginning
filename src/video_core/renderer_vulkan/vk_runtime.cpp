@@ -716,17 +716,17 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
 
 bool Runtime::IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 size,
                                bool check_read_access) {
-    MakeCurrent(handle);
-    bool has_access = resource->write_ranges.Overlaps(offset, offset + size);
+    auto& resource = buffer_access.Get(handle);
+    bool has_access = resource.write_ranges.Overlaps(offset, offset + size);
     if (check_read_access && !has_access) {
-        has_access |= resource->read_ranges.Overlaps(offset, offset + size);
+        has_access |= resource.read_ranges.Overlaps(offset, offset + size);
     }
     return has_access;
 }
 
 void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size,
                            vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access) {
-    MakeCurrent(handle);
+    auto& resource = buffer_access.Get(handle);
 
     const Interval range = {
         .start = offset,
@@ -746,10 +746,10 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
         vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eTransformFeedbackWriteEXT;
 
     if (src_access & WRITE_MASK) {
-        resource->write_ranges.Add(range);
+        resource.write_ranges.Add(range);
     }
     if (src_access & READ_MASK) {
-        resource->read_ranges.Add(range);
+        resource.read_ranges.Add(range);
     }
 
     memory_barrier.srcStageMask |= src_stage;
@@ -783,24 +783,7 @@ void Runtime::FlushBarriers() {
     memory_barrier.srcAccessMask = vk::AccessFlagBits2::eNone;
 
     image_barriers.clear();
-    for (auto& resource : resources) {
-        resource.read_ranges.Clear();
-        resource.write_ranges.Clear();
-    }
-    resources.clear();
-    resource = nullptr;
-}
-
-void Runtime::MakeCurrent(const VideoCore::Buffer* handle) {
-    if (resource && resource->handle == handle) {
-        return;
-    }
-    auto it = std::ranges::find(resources, handle, &BufferBarriers::handle);
-    if (it != resources.end()) {
-        resource = std::addressof(*it);
-        return;
-    }
-    resource = &resources.emplace_back(handle);
+    buffer_access.ResetScope();
 }
 
 } // namespace Vulkan

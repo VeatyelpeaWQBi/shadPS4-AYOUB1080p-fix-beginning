@@ -4,7 +4,9 @@
 #pragma once
 
 #include <atomic>
+#include <functional>
 #include <shared_mutex>
+#include <unordered_map>
 #include <variant>
 #include <tsl/robin_map.h>
 #include <unordered_set>
@@ -18,6 +20,7 @@
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
+#include "video_core/renderer_vulkan/vk_prewarm_budget.h"
 #include "vulkan/vulkan.hpp"
 
 template <>
@@ -45,6 +48,7 @@ class Instance;
 class Scheduler;
 class ShaderCache;
 class PipelineCompiler;
+class DriverPipelineCache;
 
 /// Key of the texture binding memo (Rasterizer::BindTextures, Tuning::tex_memo) for binding
 /// `index` of an image resource with this T#: what the image description depends on, without
@@ -170,6 +174,11 @@ public:
     void WarmUp();
     void Sync();
 
+    /// Drain every scheduler that may own retained pipeline binds before invalidating them.
+    void SetPipelineDrainCallback(std::function<void()>&& drain) {
+        drain_pipeline_commands = std::move(drain);
+    }
+
     /// Map/unmap can reuse a shader address with a shorter allocation. Forget old scan ranges
     /// before examining them, independently of uploads and writes (called by memory threads).
     void NotifyMemoryMapChanged() noexcept {
@@ -177,8 +186,10 @@ public:
     }
 
     bool LoadComputePipeline(Serialization::Archive& ar);
-    bool LoadGraphicsPipeline(Serialization::Archive& ar);
-    bool LoadPipelineStage(Serialization::Archive& ar, size_t stage);
+    bool PrewarmComputePipeline(const ComputePipelineKey& key);
+    bool LoadGraphicsPipeline(Serialization::Archive& ar, bool legacy_record = false);
+    bool LoadPipelineStage(Serialization::Archive& ar, size_t stage,
+                           u64* permutation_hash = nullptr);
 
     const GraphicsPipeline* GetGraphicsPipeline(const DrawIndirectParams params = {});
 
@@ -256,13 +267,24 @@ private:
     /// Hands a pipeline created with a deferred compilation to the worker threads, then waits
     /// for it at most async_pipeline_wait_ms. Callers skip their work while it is not ready.
     void CompileAsync(Pipeline* pipeline);
+    void CompilePreloaded(Pipeline* pipeline);
+    void FinishPreloaded();
+    bool CanPrewarm(u64 bytes);
 
 private:
     const Instance& instance;
+    // Proof follows the exact bytes used to create this module, never a later disk file.
     Scheduler& scheduler;
     AmdGpu::Liverpool* liverpool;
     DescriptorHeap desc_heap;
-    vk::UniquePipelineCache pipeline_cache;
+    std::unique_ptr<DriverPipelineCache> driver_cache;
+    std::function<void()> drain_pipeline_commands;
+    PrewarmBudget prewarm_budget;
+    u64 prewarm_estimated_bytes{};
+    // Startup-only identity memo: pipeline records often reference the same metadata.
+    // Avoid decoding/registering the same native SRT walker again for every reference.
+    std::unordered_map<u64, std::pair<u64, size_t>> prewarmed_stages;
+    std::array<const Shader::StageSpecialization*, MaxShaderStages> prewarmed_specs{};
     vk::UniquePipelineLayout pipeline_layout;
     Shader::Profile profile{};
     Shader::Pools pools;

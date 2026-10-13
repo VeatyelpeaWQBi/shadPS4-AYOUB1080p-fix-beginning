@@ -16,6 +16,7 @@
 #include "common/logging/formatter.h"
 #include "common/scope_exit.h"
 #include "core/debug_state.h"
+#include "core/benchmark_control.h"
 #include "core/devtools/layer.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/time.h"
@@ -229,7 +230,9 @@ void WindowSDL::WaitEvent() {
     // Called on main thread
     SDL_Event event;
 
-    if (!SDL_WaitEvent(&event)) {
+    const bool benchmark = Core::Benchmark::Enabled();
+    if (benchmark) Core::Benchmark::Poll(*controllers[0]);
+    if (!(benchmark ? SDL_WaitEventTimeout(&event, 50) : SDL_WaitEvent(&event))) {
         return;
     }
 

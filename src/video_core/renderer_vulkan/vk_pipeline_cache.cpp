@@ -5,8 +5,8 @@
 #include <bit>
 #include <chrono>
 #include <condition_variable>
-#include <cstring>
 #include <deque>
+#include <cstring>
 #include <limits>
 #include <mutex>
 #include <ranges>
@@ -16,6 +16,7 @@
 #include <xxhash.h>
 
 #include "common/hash.h"
+#include "common/elf_info.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
 #include "common/perf_stats.h"
@@ -33,6 +34,7 @@
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_driver_cache.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
@@ -54,15 +56,24 @@ public:
     }
 
     ~PipelineCompiler() {
+        WaitIdle();
         for (auto& worker : workers) {
             worker.request_stop();
         }
         workers.clear();
     }
 
-    void Submit(Pipeline* pipeline) {
+    void Submit(Pipeline* pipeline, bool bounded = false) {
         {
-            std::scoped_lock lk{mutex};
+            std::unique_lock lk{mutex};
+            // Runtime bursts cannot indefinitely get ahead of the compiler. Startup warmup
+            // already has its own memory budget and does not use this queue limit.
+            if (bounded && pending >= MaxRuntimePending) {
+                const u64 start = Common::Perf::NowNs();
+                done_cv.wait(lk, [this] { return pending < MaxRuntimePending; });
+                Common::Perf::Add(Common::Perf::ComputeCompileQueueWaitNs,
+                                  Common::Perf::NowNs() - start);
+            }
             queue.push_back(pipeline);
             ++pending;
         }
@@ -89,6 +100,7 @@ public:
     }
 
 private:
+    static constexpr u32 MaxRuntimePending = 64;
     void WorkerLoop(std::stop_token stoken, u32 index) {
         const auto name = fmt::format("shadPS4:PipelineCompiler{}", index);
         Common::SetCurrentThreadName(name.c_str());
@@ -720,21 +732,43 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
              "Compute shader LDS barriers for multi wave workgroups: {}, buffer memory barriers "
              "within split GCN waves: {}",
              lds_multi_wave, profile.wave_memory_barriers);
-    WarmUp();
-
-    auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
-    ASSERT_MSG(cache_result == vk::Result::eSuccess, "Failed to create pipeline cache: {}",
-               vk::to_string(cache_result));
-    pipeline_cache = std::move(cache);
-
+    prewarm_budget =
+        PrewarmBudget::FromAvailable(AvailableHostMemory(), AvailableDeviceMemory(instance));
+    const auto cache_path = EmulatorSettings.IsPipelineCacheEnabled()
+                                ? Common::FS::GetUserPath(Common::FS::PathType::CacheDir) /
+                                      Common::ElfInfo::Instance().GameSerial() / "pipeline-v2" /
+                                      "driver.vkc"
+                                : std::filesystem::path{};
+    driver_cache =
+        std::make_unique<DriverPipelineCache>(instance, cache_path, prewarm_budget.driver_bytes);
     const u32 num_compilers = std::clamp(std::thread::hardware_concurrency() / 4, 2U, 8U);
     compiler = std::make_unique<PipelineCompiler>(num_compilers);
     LOG_INFO(Render_Vulkan, "Pipelines can be compiled by {} worker threads", num_compilers);
+    WarmUp(); // Both compiler and driver cache exist before cached pipelines are created.
+    driver_cache->Start();
 }
 
 PipelineCache::~PipelineCache() {
     // Workers reference the pipelines, stop them first.
     compiler.reset();
+    driver_cache->Stop();
+}
+
+void PipelineCache::CompilePreloaded(Pipeline* pipeline) {
+    pipeline->SetDriverCache(driver_cache.get());
+    compiler->Submit(pipeline);
+}
+void PipelineCache::FinishPreloaded() {
+    compiler->WaitIdle();
+}
+bool PipelineCache::CanPrewarm(u64 bytes) {
+    if (bytes > prewarm_budget.host_bytes -
+                    std::min(prewarm_estimated_bytes, prewarm_budget.host_bytes) ||
+        !prewarm_budget.CanContinue(AvailableHostMemory(), AvailableDeviceMemory(instance),
+                                    prewarm_estimated_bytes))
+        return false;
+    prewarm_estimated_bytes += bytes;
+    return true;
 }
 
 void PipelineCache::CompileAsync(Pipeline* pipeline) {
@@ -775,9 +809,10 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
             Common::Perf::GetTuning().async_pipelines.load(std::memory_order_relaxed) >= 1;
         GraphicsPipeline::SerializationSupport sdata{};
         it.value() = std::make_unique<GraphicsPipeline>(
-            instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
-            runtime_infos, fetch_shader, modules, sdata, false, defer);
+            instance, scheduler, desc_heap, profile, graphics_key, driver_cache->Handle(), infos,
+            runtime_infos, fetch_shader, modules, sdata, false, true);
         GraphicsPipeline* const pipeline = it.value().get();
+        pipeline->SetDriverCache(driver_cache.get());
         last_graphics_key = graphics_key;
         last_graphics_pipeline = pipeline;
 
@@ -794,6 +829,8 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         }
         if (defer) {
             CompileAsync(pipeline);
+        } else {
+            pipeline->Compile();
         }
         Common::Perf::Add(Common::Perf::PipelineStallNs, Common::Perf::NowNs() - start_ns);
         return pipeline;
@@ -811,13 +848,16 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
         LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
 
         const u64 start_ns = Common::Perf::NowNs();
+        const bool retain = Common::Perf::GetTuning().compute_compile_parallel.load(
+            std::memory_order_relaxed);
         const bool defer =
             Common::Perf::GetTuning().async_pipelines.load(std::memory_order_relaxed) >= 2;
         ComputePipeline::SerializationSupport sdata{};
         it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
-                                                       *pipeline_cache, compute_key, *infos[0],
-                                                       modules[0], sdata, false, defer);
+                                                       driver_cache->Handle(), compute_key, *infos[0],
+                                                       modules[0], sdata, false, true);
         ComputePipeline* const pipeline = it.value().get();
+        pipeline->SetDriverCache(driver_cache.get());
         RegisterPipelineData(compute_key, sdata);
         ++num_new_pipelines;
 
@@ -825,8 +865,14 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
             auto& m = modules[0];
             module_related_pipelines[m].emplace_back(compute_key);
         }
-        if (defer) {
+        if (retain) {
+            pipeline->RetainComputeWork();
+            compiler->Submit(pipeline, true);
+            Common::Perf::Add(Common::Perf::ComputeCompilesQueued);
+        } else if (defer) {
             CompileAsync(pipeline);
+        } else {
+            pipeline->Compile();
         }
         Common::Perf::Add(Common::Perf::PipelineStallNs, Common::Perf::NowNs() - start_ns);
         return pipeline;
@@ -1516,6 +1562,7 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
             if (entry.valid.load(std::memory_order_relaxed) &&
                 entry.key.load(std::memory_order_relaxed) == memo_key &&
                 entry_perm < program->modules.size() &&
+                program->modules[entry_perm].module &&
                 VertexAttributesMatch(info, runtime_info, program->modules[entry_perm].spec)) {
                 Common::Perf::Add(Common::Perf::SpecMemoHits);
                 info.AddBindings(binding);
@@ -1525,7 +1572,7 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
                     fetch_shader = &fetch;
                 }
                 return std::make_tuple(&program->info, perm.module,
-                                       HashCombine(params.hash, u64{entry_perm}));
+                                             HashCombine(params.hash, u64{entry_perm}));
             }
         }
         Common::Perf::Add(Common::Perf::SpecMemoMisses);
@@ -1537,7 +1584,9 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
 
     vk::ShaderModule module{};
 
-    const auto it = std::ranges::find(program->modules, spec, &Program::Module::spec);
+    const auto it = std::ranges::find_if(program->modules, [&](const Program::Module& permutation) {
+        return permutation.module && permutation.spec == spec;
+    });
     if (it == program->modules.end()) {
         auto new_info = Shader::Info(hw_stage, sw_stage, params);
         module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding);
@@ -1566,6 +1615,12 @@ std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule mo
                                                              std::span<const u32> spv_code) {
     // Pipelines being compiled use the modules and can be erased below.
     compiler->WaitIdle();
+    // Retained binds hold pipeline pointers until replay; also finish GPU use of old handles.
+    if (drain_pipeline_commands) {
+        drain_pipeline_commands();
+    } else {
+        scheduler.Finish();
+    }
     std::optional<vk::ShaderModule> new_module{};
     for (const auto& [_, program] : program_cache) {
         for (auto& m : program->modules) {

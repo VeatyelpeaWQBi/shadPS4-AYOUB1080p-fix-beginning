@@ -7,8 +7,10 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/perf_stats.h"
 #include "common/types.h"
 #include "core/devtools/widget/gpu_memory.h"
+#include "video_core/renderer_vulkan/vk_driver_cache.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
@@ -32,7 +34,32 @@ u64 RoundAllocationSize(u64 size) {
 } // Anonymous namespace
 
 StagingBufferPool::StagingBufferPool(const Instance& instance_, Scheduler& scheduler_)
-    : instance{instance_}, scheduler{scheduler_} {}
+    : instance{instance_}, scheduler{scheduler_} {
+    automatic_budget =
+        Common::Perf::GetTuning().staging_budget_auto.load(std::memory_order_relaxed);
+    if (!automatic_budget)
+        return;
+    budget = PrewarmBudget::FromAvailable(AvailableHostMemory(), AvailableDeviceMemory(instance));
+    keep_bytes = budget.staging_keep_bytes;
+    Ring& ring = rings[u32(MemoryType::HostUncached)];
+    for (u64 size = 0; size + BLOCK_SIZE <= budget.staging_warm_bytes; size += BLOCK_SIZE) {
+        if (AvailableHostMemory() <= budget.host_reserve + BLOCK_SIZE ||
+            AvailableDeviceMemory(instance) <= budget.device_reserve)
+            break;
+        auto& block = ring.blocks.emplace_back(Block{
+            .buffer = std::make_unique<VideoCore::StreamBuffer>(
+                instance, scheduler, MemoryType::HostUncached, BLOCK_SIZE),
+            .last_used_frame = 0,
+        });
+        // Commit mapped pages before the first resource burst. Never touch a buffer in use.
+        auto& mapped = block.buffer->mapped_data;
+        for (size_t page = 0; page < mapped.size(); page += 4096)
+            mapped[page] = 0;
+        allocated_bytes.fetch_add(BLOCK_SIZE, std::memory_order_relaxed);
+    }
+    LOG_INFO(Render, "Upload pool prewarmed: {} MiB; retention budget {} MiB",
+             allocated_bytes.load(std::memory_order_relaxed) / 1_MB, keep_bytes / 1_MB);
+}
 
 StagingBufferPool::~StagingBufferPool() = default;
 
@@ -65,12 +92,15 @@ StagingBufferRef StagingBufferPool::RequestFromRing(Ring& ring, u64 size, u64 al
             best = &ring.blocks[(ring.current + 1) % ring.blocks.size()];
             best_offset = 0;
         } else {
+            Common::Perf::DiagnosticTimer allocation{Common::Perf::StagingAllocations,
+                                                     Common::Perf::StagingAllocationNs};
             best = &ring.blocks.emplace_back(Block{
                 .buffer = std::make_unique<VideoCore::StreamBuffer>(instance, scheduler, type,
                                                                     BLOCK_SIZE),
                 .last_used_frame = frame,
             });
             ring.current = ring.blocks.size() - 1;
+            allocated_bytes.fetch_add(BLOCK_SIZE, std::memory_order_relaxed);
             best_offset = *best->buffer->Reserve(size, alignment, false);
         }
     }
@@ -109,6 +139,8 @@ StagingBufferRef StagingBufferPool::RequestLarge(u64 size, MemoryType type, bool
     }
 
     if (!best) {
+        Common::Perf::DiagnosticTimer allocation{Common::Perf::StagingAllocations,
+                                                 Common::Perf::StagingAllocationNs};
         best = &cache.emplace_back(LargeBuffer{
             .buffer = std::make_unique<VideoCore::Buffer>(instance, 0, RoundAllocationSize(size),
                                                           type, "StagingBufferPool:Dedicated"),
@@ -116,6 +148,7 @@ StagingBufferRef StagingBufferPool::RequestLarge(u64 size, MemoryType type, bool
             .last_used_frame = frame,
             .held = false,
         });
+        allocated_bytes.fetch_add(best->buffer->SizeBytes(), std::memory_order_relaxed);
     }
 
     best->tick = scheduler.CurrentTick();
@@ -149,6 +182,13 @@ void StagingBufferPool::FreeDeferred(const StagingBufferRef& ref) {
 
 void StagingBufferPool::TickFrame() {
     ++frame;
+    if (automatic_budget && frame.load(std::memory_order_relaxed) % 60 == 0) {
+        // Release surplus reusable blocks under pressure; no allocation/pre-touch at runtime.
+        keep_bytes = AvailableHostMemory() > budget.host_reserve &&
+                             AvailableDeviceMemory(instance) > budget.device_reserve
+                         ? budget.staging_keep_bytes
+                         : 0;
+    }
     for (Ring& ring : rings) {
         TrimRing(ring);
     }
@@ -162,10 +202,13 @@ void StagingBufferPool::TrimRing(Ring& ring) {
     auto& blocks = ring.blocks;
     for (size_t i = blocks.size(); i-- > 0;) {
         const Block& block = blocks[i];
+        if (allocated_bytes.load(std::memory_order_relaxed) <= keep_bytes)
+            break;
         if (frame - block.last_used_frame < RING_IDLE_FRAMES ||
             !scheduler.IsFree(block.buffer->LastTick())) {
             continue;
         }
+        allocated_bytes.fetch_sub(block.buffer->SizeBytes(), std::memory_order_relaxed);
         blocks.erase(blocks.begin() + i);
         if (i < ring.current) {
             --ring.current;
@@ -181,8 +224,13 @@ void StagingBufferPool::TrimRing(Ring& ring) {
 void StagingBufferPool::TrimLarge(std::vector<LargeBuffer>& cache) {
     std::scoped_lock lk{large_mutex};
     std::erase_if(cache, [this](const LargeBuffer& entry) {
-        return !entry.held && frame - entry.last_used_frame >= LARGE_IDLE_FRAMES &&
-               scheduler.IsFree(entry.tick);
+        if (allocated_bytes.load(std::memory_order_relaxed) <= keep_bytes || entry.held ||
+            frame - entry.last_used_frame <
+                (automatic_budget && keep_bytes ? 1800 : LARGE_IDLE_FRAMES) ||
+            !scheduler.IsFree(entry.tick))
+            return false;
+        allocated_bytes.fetch_sub(entry.buffer->SizeBytes(), std::memory_order_relaxed);
+        return true;
     });
 }
 

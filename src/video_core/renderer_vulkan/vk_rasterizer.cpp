@@ -5,11 +5,14 @@
 
 #include <array>
 #include <filesystem>
+#include <fstream>
 #include "common/debug.h"
+#include "common/elf_info.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
 #include "common/perf_stats.h"
 #include "core/debug_state.h"
+#include "core/benchmark_control.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "shader_recompiler/runtime_info.h"
@@ -516,6 +519,11 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
       host_markers_enabled{EmulatorSettings.IsVkHostMarkersEnabled()},
       guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()},
       occlusion{instance, scheduler} {
+    if (Core::Benchmark::Enabled()) {
+        std::ofstream{Core::Benchmark::TuningPath().parent_path() / "renderer.json"}
+            << fmt::format("{{\"compute_queue\":{},\"readback_queue\":{}}}",
+                           instance.HasComputeQueue(), instance.HasReadbackQueue());
+    }
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
         // The scout follows the command stream from the start, so that its registers match
@@ -531,6 +539,12 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         runtime.FlushBarriers();
         buffer_cache.SubmitPendingArenaBinds(info);
     });
+    pipeline_cache.SetPipelineDrainCallback([this] {
+        if (compute_scheduler) {
+            compute_scheduler->Finish();
+        }
+        scheduler.Finish();
+    });
 }
 
 Rasterizer::~Rasterizer() {
@@ -539,6 +553,9 @@ Rasterizer::~Rasterizer() {
         buffer_cache.SetCrossQueueTracking(nullptr);
         compute_scheduler->Finish();
     }
+    // The recorder may still own a bind capturing a PipelineCache entry. Drain it before
+    // member destruction releases those entries, descriptors or resource buffers.
+    scheduler.Finish();
 }
 
 bool Rasterizer::UseComputeQueue(const ComputePipeline* pipeline) {
@@ -878,6 +895,13 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
                  regs.num_indices, regs.num_instances.NumInstances(), state, 0);
     }
 
+    const bool profile_draw =
+        Common::Perf::GetTuning().gpu_profile.load(std::memory_order_relaxed) == 3;
+    if (profile_draw) {
+        const auto* fragment = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+        scheduler.ProfileDrawBegin(fragment ? fragment->pgm_hash :
+            pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash | (1ULL << 63));
+    }
     if (is_indexed) {
         cmdbuf.drawIndexed(regs.num_indices, regs.num_instances.NumInstances(), 0,
                            s32(vertex_offset), instance_offset);
@@ -885,6 +909,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         cmdbuf.draw(regs.num_indices, regs.num_instances.NumInstances(), vertex_offset,
                     instance_offset);
     }
+    if (profile_draw) scheduler.ProfileDrawEnd();
     DebugState.IncDrawCall();
 
     if (g_dump.frames_left != 0) [[unlikely]] {
@@ -914,18 +939,32 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     }
     if (const u64 trace_ps = Common::Perf::GetTuning().trace_draw.load(std::memory_order_relaxed);
         trace_ps != 0) [[unlikely]] {
-        // Particle trace: the arguments of this draw as guest memory has them, each frame.
+        // Sample this diagnostic: an inactive particle shader can have thousands of draw
+        // commands per frame. Its GPU-owned argument bytes in backing memory may be stale.
         for (const Shader::Info* stage : pipeline->GetStages()) {
             if (stage && stage->hw_stage == Shader::HwStage::Fragment &&
                 stage->pgm_hash == trace_ps) {
+                static u64 window_start{};
+                static u64 visits{};
+                static u32 logged{};
+                if ((visits++ & 4095) != 0) break;
+                const u64 now = Common::Perf::NowNs();
+                if (now - window_start >= 1'000'000'000ULL) {
+                    window_start = now;
+                    logged = 0;
+                }
+                if (logged++ >= 8) break;
                 std::array<u32, 4> args{};
                 memory->CopySparseMemory(arg_address + offset, reinterpret_cast<u8*>(args.data()),
                                          sizeof(args));
                 LOG_INFO(Render_Vulkan,
-                         "PTRACE draw f{} ps {:x} args {:x} {},{},{},{} max {} count {:x}{}",
+                         "PTRACE draw f{} ps {:x} args {:x} {},{},{},{} max {} count {:x}{} "
+                         "GPU-owned {} CPU-modified {}",
                          Common::Perf::GuestFrameCounter().load(std::memory_order_relaxed),
                          trace_ps, arg_address + offset, args[0], args[1], args[2], args[3],
-                         max_count, count_address, pipeline->IsReady() ? "" : " not-ready");
+                         max_count, count_address, pipeline->IsReady() ? "" : " not-ready",
+                         buffer_cache.HasGpuData(arg_address + offset, sizeof(args)),
+                         buffer_cache.IsRegionCpuModified(arg_address + offset, sizeof(args)));
                 break;
             }
         }
@@ -992,6 +1031,13 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
                  max_count, stride, state, arg_address + offset);
     }
 
+    const bool profile_draw =
+        Common::Perf::GetTuning().gpu_profile.load(std::memory_order_relaxed) == 3;
+    if (profile_draw) {
+        const auto* fragment = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+        scheduler.ProfileDrawBegin(fragment ? fragment->pgm_hash :
+            pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash | (1ULL << 63));
+    }
     if (is_indexed) {
         ASSERT(sizeof(VkDrawIndexedIndirectCommand) == stride);
 
@@ -1014,6 +1060,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         DebugState.IncDrawCall();
     }
 
+    if (profile_draw) scheduler.ProfileDrawEnd();
     if (g_dump.frames_left != 0) [[unlikely]] {
         DumpAfter(pipeline);
     }
@@ -1068,13 +1115,14 @@ void Rasterizer::DispatchDirect() {
     pipeline->BindResources(Sched(), set_writes, push_data);
 
     const auto cmdbuf = Sched().Recorder();
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
+    pipeline->BindCompute(Sched());
     if (GpuCrashDiag::Enabled()) {
         MarkDispatch(Sched(), cmdbuf, cs.pgm_hash, cs_program.dim_x, cs_program.dim_y,
                      cs_program.dim_z, 0);
     }
     Sched().ProfileDispatchBegin(cs.pgm_hash);
     cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
+    if (on_compute_queue) Core::Benchmark::NoteNativeCompute(!async_compute_translation);
     Sched().ProfileDispatchEnd();
     DebugState.IncDispatch();
 
@@ -1127,7 +1175,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     pipeline->BindResources(Sched(), set_writes, push_data);
 
     const auto cmdbuf = Sched().Recorder();
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
+    pipeline->BindCompute(Sched());
     if (GpuCrashDiag::Enabled()) {
         MarkDispatch(Sched(), cmdbuf, pipeline->GetStage(Shader::SwStage::Compute).pgm_hash, 0, 0,
                      0, address + offset);
@@ -1279,7 +1327,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         IsComputeImageClear(pipeline)) {
         return false;
     }
-    if (!pipeline->IsReady()) {
+    if (!pipeline->IsReady() && !pipeline->RetainsComputeWork()) {
         // Still compiled by a worker thread (only the emulated dispatches above can run).
         Common::Perf::Add(Common::Perf::PipelineSkips);
         RecordSkippedWrites(*pipeline);
@@ -1905,7 +1953,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 buffer_infos.emplace_back(buffer->Handle(), offset_aligned, size + adjust);
                 if (desc.is_written) {
                     // Raw storage-buffer writes can also make an aliased cached image stale.
-                    texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);
+                    texture_cache.InvalidateMemoryFromGPU(
+                        vsharp.base_address, size);
                     if (!skipped_writes.empty()) {
                         ClearSkippedWrites(vsharp.base_address, size);
                     }
@@ -1915,8 +1964,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 if (buffer != &buffer_cache.GetStreamBuffer()) {
                     bound_buffers.emplace_back(buffer, offset, size, desc.is_written,
                                                vsharp.base_address);
-                    needs_barrier |=
-                        Rt().IsBufferAccessed(buffer, offset, size, desc.is_written);
+                    needs_barrier |= Rt().IsBufferAccessed(buffer, offset, size, desc.is_written);
                 }
             }
         }

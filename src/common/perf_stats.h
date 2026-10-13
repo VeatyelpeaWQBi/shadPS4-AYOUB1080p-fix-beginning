@@ -269,6 +269,15 @@ enum Counter : u32 {
     CrossWaitsCompute,
     CrossQueueFlushes,
     CrossQueueFirstTouches,
+    GuestFileReads,
+    GuestFileBytes,
+    GuestFileReadNs,
+    GuestFilePrepareNs,
+    GuestFileCopyNs,
+    StagingAllocations,
+    StagingAllocationNs,
+    UploadProtectionNs,
+    UploadCopyNs,
     // Exact runtime snapshots: successful cross-epoch params checks, full scans, bytes checked;
     // repeated specialization selections, and immutable flat-buffer uploads reused/copied.
     ParamsMemoRevalidated,
@@ -279,6 +288,11 @@ enum Counter : u32 {
     FlatbufMemoHits,
     FlatbufMemoMisses,
     FlatbufMemoSavedBytes,
+    ComputeCompilesQueued,
+    ComputeBindsDeferred,
+    ComputeBindWaits,
+    ComputeBindWaitNs,
+    ComputeCompileQueueWaitNs,
     CounterCount,
 };
 
@@ -366,6 +380,9 @@ struct Tuning {
     std::atomic<u32> async_pipelines{2};
     /// How long the command processor waits for a new pipeline before skipping its work.
     std::atomic<u32> async_pipeline_wait_us{3000};
+    /// Prepare actual compute pipelines in parallel, retaining their work. Commands wait
+    /// before binding a handle; no dispatch is skipped. Independent of async_pipelines.
+    std::atomic<bool> compute_compile_parallel{false};
     /// Records a GPU checkpoint before each draw and dispatch, reported with the device fault
     /// information when the GPU crashes (device lost).
     std::atomic<bool> gpu_checkpoints{false};
@@ -452,6 +469,8 @@ struct Tuning {
     /// Buffer uploads protect their pages again and copy guest memory to staging memory on a
     /// worker thread instead of the command processor (the submission waits for it).
     std::atomic<bool> async_uploads{false};
+    /// Retain and pre-touch bounded upload pools on memory-rich Infamous hosts.
+    std::atomic<bool> staging_budget_auto{false};
     /// The recording thread waits for new commands this long (microseconds) before sleeping,
     /// so the command processor rarely has to wake it up with a system call (0: sleeps at once).
     std::atomic<u32> recorder_spin_us{0};
@@ -534,7 +553,8 @@ struct Tuning {
     std::atomic<u32> gpu_threads_priority{0};
     /// GPU timestamps (diagnostics): 1 around each submission of the command processor (GPU busy
     /// time, submissions in flight, those carrying readbacks), 2 also around each compute
-    /// dispatch (GPU time per compute shader, top shaders logged every 5 s).
+    /// dispatch. 3 samples one in 32 graphics draw commands per shader; estimates are
+    /// diagnostic rankings, not uninstrumented frame timings.
     std::atomic<u32> gpu_profile{0};
     /// readback_relaxed_sites: code of the game (offsets of 256 byte blocks of its executable, as
     /// the readback site report shows them) whose reads of GPU written memory do not wait for
@@ -584,6 +604,11 @@ inline std::atomic<u32>& GpuThreadCpu() {
 }
 
 inline void Add(Counter counter, u64 value = 1) {
+    // These totals are only consumed by OnFlip's diagnostics. Ordinary rendering must not
+    // allocate a per-thread counter block or update it for every draw, bind and page fault.
+    if (!GetTuning().perf_log.load(std::memory_order_relaxed)) {
+        return;
+    }
     bool shared;
     auto& slot = LocalCounters(shared)->values[counter];
     if (shared) [[unlikely]] {
@@ -613,10 +638,14 @@ inline u32 CurrentCpu() {
 class ScopedTimer {
 public:
     ScopedTimer(Counter count_counter_, Counter ns_counter_)
-        : count_counter{count_counter_}, ns_counter{ns_counter_}, start{NowNs()} {}
+        : count_counter{count_counter_}, ns_counter{ns_counter_},
+          enabled{GetTuning().perf_log.load(std::memory_order_relaxed)},
+          start{enabled ? NowNs() : 0} {}
     ~ScopedTimer() {
-        Add(count_counter);
-        Add(ns_counter, NowNs() - start);
+        if (enabled) {
+            Add(count_counter);
+            Add(ns_counter, NowNs() - start);
+        }
     }
     ScopedTimer(const ScopedTimer&) = delete;
     ScopedTimer& operator=(const ScopedTimer&) = delete;
@@ -624,6 +653,26 @@ public:
 private:
     Counter count_counter;
     Counter ns_counter;
+    bool enabled;
+    u64 start;
+};
+
+/// Extra cold-path diagnostics incur no clock queries during ordinary performance runs.
+class DiagnosticTimer {
+public:
+    DiagnosticTimer(Counter count, Counter time)
+        : count{count}, time{time}, enabled{GetTuning().perf_log.load(std::memory_order_relaxed)},
+          start{enabled ? NowNs() : 0} {}
+    ~DiagnosticTimer() {
+        if (enabled) {
+            Add(count);
+            Add(time, NowNs() - start);
+        }
+    }
+
+private:
+    Counter count, time;
+    bool enabled;
     u64 start;
 };
 
@@ -682,25 +731,32 @@ inline void OnFlip(float draws_per_frame, float dispatches_per_frame) {
 
     if (frame_ms > SlowFrameMs && r.slow_logged < MaxSlowFramesPerSecond) {
         ++r.slow_logged;
-        LOG_WARNING(Debug,
-                    "Perf slow frame #{}: {:.1f} ms | shaders {} ({:.1f} ms) pipelines {} ({:.1f} "
-                    "ms compile, {:.1f} ms stall, {} skipped) | gpu waits {} ({:.1f} ms) | "
-                    "readbacks R{} W{} D{} ({:.1f} ms stalled: queue {:.1f} ms, gpu sync {:.1f} "
-                    "ms, {:.2f} MB, async {} waiting {:.1f} ms) | faults R{} W{} | protect "
-                    "{} ({:.1f} ms) | buffer uploads {} ({:.2f} MB, {:.1f} ms) | image refresh {} "
-                    "({:.2f} MB, {:.1f} ms) new images {} | gpu thread work {:.1f} ms spin {:.1f} "
-                    "ms",
-                    r.flip_index, frame_ms, frame[ShaderCompiles], ms(frame[ShaderCompileNs]),
-                    frame[PipelineCreates], ms(frame[PipelineCreateNs]), ms(frame[PipelineStallNs]),
-                    frame[PipelineSkips], frame[GpuWaits], ms(frame[GpuWaitNs]),
-                    frame[ReadbackReads], frame[ReadbackWrites], frame[ReadbackDiscards],
-                    ms(frame[ReadbackStallNs]), ms(frame[ReadbackQueueNs]),
-                    ms(frame[ReadbackSyncNs]), mb(frame[ReadbackBytes]), frame[ReadbackAsync],
-                    ms(frame[ReadbackAsyncWaitNs]), frame[FaultReads], frame[FaultWrites],
-                    frame[ProtectCalls], ms(frame[ProtectNs]), frame[BufferUploads],
-                    mb(frame[BufferUploadBytes]), ms(frame[BufferUploadNs]), frame[ImageRefreshes],
-                    mb(frame[ImageUploadBytes]), ms(frame[ImageRefreshNs]), frame[ImageCreates],
-                    ms(frame[GpuBusyNs]), ms(frame[GpuSpinNs]));
+        LOG_WARNING(
+            Debug,
+            "Perf slow frame #{}: {:.1f} ms | shaders {} ({:.1f} ms) pipelines {} ({:.1f} "
+            "ms compile, {:.1f} ms stall, {} skipped) | gpu waits {} ({:.1f} ms) | "
+            "readbacks R{} W{} D{} ({:.1f} ms stalled: queue {:.1f} ms, gpu sync {:.1f} "
+            "ms, {:.2f} MB, async {} waiting {:.1f} ms) | faults R{} W{} | protect "
+            "{} ({:.1f} ms) | buffer uploads {} ({:.2f} MB, {:.1f} ms) | image refresh {} "
+            "({:.2f} MB, {:.1f} ms) new images {} | gpu thread work {:.1f} ms spin {:.1f} "
+            "ms | file reads {} ({:.2f} MB, {:.1f} ms IO, {:.1f} ms prepare, {:.1f} ms copy) "
+            "| staging allocations {} ({:.1f} ms) | upload protect {:.1f} ms copy {:.1f} ms "
+            "| compute compile: queued {} deferred binds {} wait {} ({:.1f} ms) queue {:.1f} ms",
+            r.flip_index, frame_ms, frame[ShaderCompiles], ms(frame[ShaderCompileNs]),
+            frame[PipelineCreates], ms(frame[PipelineCreateNs]), ms(frame[PipelineStallNs]),
+            frame[PipelineSkips], frame[GpuWaits], ms(frame[GpuWaitNs]), frame[ReadbackReads],
+            frame[ReadbackWrites], frame[ReadbackDiscards], ms(frame[ReadbackStallNs]),
+            ms(frame[ReadbackQueueNs]), ms(frame[ReadbackSyncNs]), mb(frame[ReadbackBytes]),
+            frame[ReadbackAsync], ms(frame[ReadbackAsyncWaitNs]), frame[FaultReads],
+            frame[FaultWrites], frame[ProtectCalls], ms(frame[ProtectNs]), frame[BufferUploads],
+            mb(frame[BufferUploadBytes]), ms(frame[BufferUploadNs]), frame[ImageRefreshes],
+            mb(frame[ImageUploadBytes]), ms(frame[ImageRefreshNs]), frame[ImageCreates],
+            ms(frame[GpuBusyNs]), ms(frame[GpuSpinNs]), frame[GuestFileReads],
+            mb(frame[GuestFileBytes]), ms(frame[GuestFileReadNs]), ms(frame[GuestFilePrepareNs]),
+            ms(frame[GuestFileCopyNs]), frame[StagingAllocations], ms(frame[StagingAllocationNs]),
+            ms(frame[UploadProtectionNs]), ms(frame[UploadCopyNs]), frame[ComputeCompilesQueued],
+            frame[ComputeBindsDeferred], frame[ComputeBindWaits], ms(frame[ComputeBindWaitNs]),
+            ms(frame[ComputeCompileQueueWaitNs]));
     }
 
     const u64 window_ns = now - r.window_start;
@@ -749,7 +805,8 @@ inline void OnFlip(float draws_per_frame, float dispatches_per_frame) {
              "left {}) | asc queue dispatches {} fallbacks {} submits {} waits gfx {} compute {} "
              "flushes {} first touches {} | draws/frame {:.0f} dispatches/frame {:.0f} | "
              "runtime memo: params revalidated {} scans {} checked {:.2f} MB selection {}/{} "
-             "flat uploads {}/{} saved {:.2f} MB",
+             "flat uploads {}/{} saved {:.2f} MB | compute compile: queued {} deferred binds {} "
+             "wait {} ({:.1f} ms) queue {:.1f} ms",
              static_cast<double>(r.frames) / seconds,
              r.frames ? r.frame_ms_sum / static_cast<double>(r.frames) : 0.0, r.frame_ms_max,
              r.frames_over_33, r.frames_over_50, pct(t[GpuBusyNs]), pct(t[GpuSpinNs]),
@@ -818,7 +875,9 @@ inline void OnFlip(float draws_per_frame, float dispatches_per_frame) {
              t[CrossWaitsCompute], t[CrossQueueFlushes], t[CrossQueueFirstTouches],
              draws_per_frame, dispatches_per_frame, t[ParamsMemoRevalidated], t[ParamsHeaderScans],
              mb(t[ParamsValidationBytes]), t[SelectionMemoHits], t[SelectionMemoMisses],
-             t[FlatbufMemoHits], t[FlatbufMemoMisses], mb(t[FlatbufMemoSavedBytes]));
+             t[FlatbufMemoHits], t[FlatbufMemoMisses], mb(t[FlatbufMemoSavedBytes]),
+             t[ComputeCompilesQueued], t[ComputeBindsDeferred], t[ComputeBindWaits],
+             ms(t[ComputeBindWaitNs]), ms(t[ComputeCompileQueueWaitNs]));
 
     const u64 last_flip = r.last_flip;
     const u64 flip_index = r.flip_index;

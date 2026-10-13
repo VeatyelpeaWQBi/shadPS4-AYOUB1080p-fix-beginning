@@ -8,6 +8,7 @@
 #include "common/assert.h"
 #include "common/error.h"
 #include "common/logging/log.h"
+#include "common/perf_stats.h"
 #include "common/scope_exit.h"
 #include "common/singleton.h"
 #include "core/file_sys/devices/console_device.h"
@@ -347,6 +348,9 @@ s64 PS4_SYSV_ABI sceKernelWrite(s32 fd, const void* buf, u64 nbytes) {
 static thread_local std::vector<u8> file_buf{};
 
 s64 ReadFile(Core::FileSys::File* file, void* buf, u64 nbytes) {
+    using namespace Common::Perf;
+    const bool profile = GetTuning().perf_log.load(std::memory_order_relaxed);
+    const u64 prepare_start = profile ? NowNs() : 0;
     const auto* memory = Core::Memory::Instance();
     // Invalidate up to the actual number of bytes that could be read.
     const auto remaining = file->GetSize() - file->Tell();
@@ -354,11 +358,23 @@ s64 ReadFile(Core::FileSys::File* file, void* buf, u64 nbytes) {
     if (file_buf.capacity() < nbytes) {
         file_buf.reserve(nbytes);
     }
+    const u64 io_start = profile ? NowNs() : 0;
+    if (profile)
+        Add(GuestFilePrepareNs, io_start - prepare_start);
     s64 bytes = file->Read(file_buf.data(), nbytes);
+    const u64 copy_start = profile ? NowNs() : 0;
+    if (profile) {
+        Add(GuestFileReads);
+        Add(GuestFileReadNs, copy_start - io_start);
+    }
     if (bytes < 0) {
         return bytes;
     }
     std::memcpy(buf, file_buf.data(), bytes);
+    if (profile) {
+        Add(GuestFileBytes, bytes);
+        Add(GuestFileCopyNs, NowNs() - copy_start);
+    }
     return bytes;
 }
 

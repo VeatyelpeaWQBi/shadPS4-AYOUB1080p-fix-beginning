@@ -11,6 +11,7 @@
 #include "shader_recompiler/backend/spirv/emit_spirv_quad_rect.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
+#include "video_core/renderer_vulkan/vk_driver_cache.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
@@ -98,8 +99,9 @@ GraphicsPipeline::GraphicsPipeline(
     }
     const bool discard_fragment =
         !infos[u32(Shader::SwStage::Fragment)] &&
-        runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs.clip_distance_emulation;
-    if (discard_fragment && !preloading) {
+        (!sdata.fragment.empty() ||
+         runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs.clip_distance_emulation);
+    if (discard_fragment && sdata.fragment.empty()) {
         const auto& vs = runtime_infos[static_cast<u32>(Shader::SwStage::Vertex)].hw.vs;
         sdata.fragment = Shader::Backend::SPIRV::EmitDiscardFragmentShader(vs.outputs);
     }
@@ -448,8 +450,9 @@ void GraphicsPipeline::Compile() {
         .layout = *pipeline_layout,
     };
 
-    auto [pipeline_result, pipe] =
-        device.createGraphicsPipelineUnique(build->pipeline_cache, pipeline_info);
+    auto access = driver_cache ? driver_cache->Acquire()
+                               : DriverPipelineCache::Lease{{}, build->pipeline_cache};
+    auto [pipeline_result, pipe] = device.createGraphicsPipelineUnique(access.cache, pipeline_info);
     ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create graphics pipeline: {}",
                vk::to_string(pipeline_result));
     pipeline = std::move(pipe);
@@ -457,6 +460,8 @@ void GraphicsPipeline::Compile() {
     build.reset();
     Common::Perf::Add(Common::Perf::PipelineCreates);
     Common::Perf::Add(Common::Perf::PipelineCreateNs, Common::Perf::NowNs() - start_ns);
+    if (driver_cache)
+        driver_cache->Compiled();
     MarkReady();
 }
 

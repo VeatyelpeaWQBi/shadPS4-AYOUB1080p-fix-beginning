@@ -8,7 +8,7 @@
 #include "common/types.h"
 
 #include <functional>
-#include <thread>
+#include <memory>
 #include <vector>
 
 namespace Storage {
@@ -22,6 +22,8 @@ enum class BlobType : u32 {
 
 class DataBase {
 public:
+    DataBase();
+    ~DataBase();
     static DataBase& Instance() {
         return *Common::Singleton<DataBase>::Instance();
     }
@@ -30,9 +32,8 @@ public:
     void Close();
     /// Moves the current (incompatible) cache aside and reopens an empty one.
     void Reset();
-    [[nodiscard]] bool IsOpened() const {
-        return opened;
-    }
+    [[nodiscard]] bool IsOpened() const;
+    void SetWriteBudget(u64 bytes);
     void FinishPreload();
 
     bool Save(BlobType type, const std::string& name, std::vector<u8>&& data);
@@ -44,9 +45,8 @@ public:
     void ForEachBlob(BlobType type, const std::function<void(std::vector<u8>&& data)>& func);
 
 private:
-    std::jthread io_worker{};
-    std::filesystem::path cache_path{};
-    bool opened{};
+    struct Impl;
+    std::unique_ptr<Impl> impl;
 };
 
 } // namespace Storage

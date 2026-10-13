@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <span>
+
 #include "video_core/renderer_vulkan/vk_common.h"
 #include "video_core/renderer_vulkan/vk_pipeline_common.h"
 
@@ -48,7 +50,7 @@ public:
                     const Shader::Profile& profile, vk::PipelineCache pipeline_cache,
                     ComputePipelineKey compute_key, const Shader::Info& info,
                     vk::ShaderModule module, SerializationSupport& sdata, bool preloading,
-                    bool defer_compile = false);
+                    bool defer_compile = false, std::span<const u32> cached_image_bindings = {});
     ~ComputePipeline() override;
 
     void Compile() override;

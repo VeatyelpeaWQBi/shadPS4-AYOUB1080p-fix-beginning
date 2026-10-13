@@ -18,6 +18,7 @@
 #include "common/memory_patcher.h"
 #include "common/path_util.h"
 #include "core/debugger.h"
+#include "core/benchmark_control.h"
 #include "core/emulator_settings.h"
 #include "core/emulator_state.h"
 #include "core/file_sys/fs.h"
@@ -56,6 +57,7 @@ int main(int argc, char* argv[]) {
     std::optional<std::string> gamePath;
     std::vector<std::string> gameArgs;
     std::optional<std::filesystem::path> overrideRoot;
+    std::optional<std::filesystem::path> benchmarkDirectory;
     std::optional<int> waitPid;
     bool waitForDebugger = false;
     bool userfaultfd = false;
@@ -90,6 +92,9 @@ int main(int argc, char* argv[]) {
     app.add_option("-f,--fullscreen", fullscreenStr, "Fullscreen mode (true|false)");
 
     app.add_option("--override-root", overrideRoot)->check(CLI::ExistingDirectory);
+    app.add_option("--benchmark-dir", benchmarkDirectory,
+                   "CUSA00309 test directory: isolated saves, logs and local control file")
+        ->check(CLI::ExistingDirectory);
 
     app.add_flag("--wait-for-debugger", waitForDebugger);
     app.add_option("--wait-for-pid", waitPid);
@@ -149,6 +154,7 @@ int main(int argc, char* argv[]) {
         Core::Debugger::WaitForPid(*waitPid);
 
     // Initialize main log with default config
+    if (benchmarkDirectory) Core::Benchmark::Configure(*benchmarkDirectory);
     Common::Log::Setup("shadps4.log");
 
     LOG_INFO(Debug, "Run: {}", fmt::join(std::span(argv, argc), ""));

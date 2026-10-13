@@ -136,6 +136,11 @@ As for shadPS4: clone with the submodules (`git clone --recursive`), then follow
 `documents`). Releases are built from the commit of their tag with clang-cl, CMake and Ninja
 (`-DCMAKE_BUILD_TYPE=Release`).
 
+For an already prepared Windows checkout, double-click [`build.bat`](build.bat) for an incremental
+Release build, or run `scripts\build_release.ps1 -RunCacheTests` to include the cache tests.
+The script reuses installed tools and existing dependencies without downloading them.
+See the [local build instructions](documents/Debugging/windows-local-build.md) (Chinese).
+
 ### License
 
 GPL-2.0-or-later, like shadPS4 ([LICENSE](LICENSE)). The source code of a release is the commit of its
@@ -263,6 +268,11 @@ Comme pour shadPS4 : cloner avec les sous-modules (`git clone --recursive`), pui
 [documents/building-windows.md](documents/building-windows.md) (Linux et macOS : les autres fichiers de
 `documents`). Les releases sont compilées depuis le commit de leur tag avec clang-cl, CMake et Ninja
 (`-DCMAKE_BUILD_TYPE=Release`).
+
+Pour un environnement Windows déjà préparé, ouvrir [`build.bat`](build.bat) pour une compilation
+Release incrémentale, ou lancer `scripts\build_release.ps1 -RunCacheTests` pour inclure les tests du
+cache. Le script réutilise les outils et dépendances installés sans les télécharger.
+Voir les [instructions locales](documents/Debugging/windows-local-build.md) (en chinois).
 
 ### Licence
 

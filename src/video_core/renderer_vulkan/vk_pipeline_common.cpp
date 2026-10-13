@@ -3,6 +3,7 @@
 
 #include <boost/container/static_vector.hpp>
 
+#include "common/perf_stats.h"
 #include "shader_recompiler/resource.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
@@ -18,6 +19,31 @@ Pipeline::Pipeline(const Instance& instance_, Scheduler& scheduler_, DescriptorH
       is_compute{is_compute_} {}
 
 Pipeline::~Pipeline() = default;
+
+void Pipeline::BindCompute(Scheduler& on) const {
+    ASSERT(IsCompute());
+    const auto cmdbuf = on.Recorder();
+    if (IsReady()) {
+        cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, Handle());
+        return;
+    }
+    ASSERT_MSG(RetainsComputeWork(), "Only retained compute work can bind a pending pipeline");
+    // The producer cannot cache a handle that does not exist yet. Forget only the compute
+    // bind, so an A -> pending B -> ready A sequence cannot omit the final A bind.
+    on.GetDynamicState().binds.pipelines[1] = vk::Pipeline{};
+    Common::Perf::Add(Common::Perf::ComputeBindsDeferred);
+    cmdbuf.Record([this](vk::CommandBuffer command) {
+        if (!IsReady()) {
+            const u64 start = Common::Perf::NowNs();
+            readiness.Wait();
+            Common::Perf::Add(Common::Perf::ComputeBindWaits);
+            Common::Perf::Add(Common::Perf::ComputeBindWaitNs, Common::Perf::NowNs() - start);
+        }
+        // Acquire also on the no-wait path before accessing the driver's handle.
+        ASSERT(IsReady());
+        command.bindPipeline(vk::PipelineBindPoint::eCompute, Handle());
+    });
+}
 
 void Pipeline::BindResources(DescriptorWrites& set_writes,
                              const Shader::PushData& push_data) const {

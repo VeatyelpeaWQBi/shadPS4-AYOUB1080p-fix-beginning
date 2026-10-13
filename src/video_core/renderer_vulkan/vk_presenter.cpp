@@ -8,6 +8,7 @@
 #include "common/perf_stats.h"
 #include "common/singleton.h"
 #include "core/debug_state.h"
+#include "core/benchmark_control.h"
 #include "core/devtools/layer.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/system/systemservice.h"
@@ -519,6 +520,11 @@ Presenter::~Presenter() {
         device.destroyImageView(frame.image_view);
         device.destroyFence(frame.present_done);
     }
+}
+
+void Presenter::SavePipelineCache() {
+    if (rasterizer)
+        rasterizer->GetPipelineCache().Sync();
 }
 
 bool Presenter::IsVideoOutSurface(const AmdGpu::ColorBuffer& color_buffer) const {
@@ -1089,6 +1095,7 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     free_frame();
     if (!is_reusing_frame && is_game_frame) {
         DebugState.IncFlipFrameNum();
+        Core::Benchmark::OnFlip();
         Common::Perf::OnFlip(DebugState.GetDrawCallsAvg(), DebugState.GetDispatchesAvg());
         Core::PerfSampler::PollTuning();
     }

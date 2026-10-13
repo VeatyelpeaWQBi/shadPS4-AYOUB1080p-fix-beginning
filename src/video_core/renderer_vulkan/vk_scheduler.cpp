@@ -18,6 +18,7 @@
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/perf_stats.h"
+#include "common/scope_exit.h"
 #include "common/thread.h"
 #include "imgui/renderer/texture_manager.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -37,6 +38,10 @@ inline void CpuRelax() {
 } // Anonymous namespace
 
 std::mutex Scheduler::submit_mutex;
+
+// Submit callbacks can append barriers while holding the shared queue mutex. They must not
+// block for recorder space: a recorder submission may need that same mutex to make room.
+static thread_local bool in_submit_callback{};
 
 namespace GpuCrashDiag {
 
@@ -224,6 +229,7 @@ struct Scheduler::GpuProfile {
         u64 begin; ///< Query numbers (monotonic, the ring index is the number modulo NumQueries).
         u64 end;
         u64 hash;
+        bool graphics{};
     };
     struct Session {
         u64 tick{};
@@ -301,6 +307,9 @@ struct Scheduler::GpuProfile {
     u64 last_end{}; ///< Latest end timestamp read (busy time without overlaps).
     u64 open_dispatch{NoQuery};
     u64 open_hash{};
+    bool open_graphics{};
+    std::unordered_map<u64, std::pair<u64, u64>> graphics_ns;
+    std::unordered_map<u64, u64> graphics_seen;
     std::unordered_map<u64, std::pair<u64, u64>> shader_ns; ///< hash: GPU ns, dispatches.
     u64 report_start_ns{};
     std::vector<u64> results;
@@ -358,7 +367,7 @@ CommandStream& Scheduler::Stream() {
     session_used = true;
     // Batches of commands go to the recording thread while the next ones are recorded.
     static constexpr size_t DispatchCommands = 256;
-    if (stream->NumCommands() >= DispatchCommands) {
+    if (stream->NumCommands() >= DispatchCommands && !in_submit_callback) {
         DispatchStream();
     }
     return *stream;
@@ -373,7 +382,8 @@ void Scheduler::DispatchStream() {
     std::unique_ptr<CommandStream> next;
     bool wake;
     {
-        std::scoped_lock lk{recorder_mutex};
+        std::unique_lock lk{recorder_mutex};
+        WaitForRecorderRoom(lk);
         recorder_jobs.push_back(RecorderJob{.stream = std::move(stream)});
         recorder_queued.fetch_add(1, std::memory_order_release);
         if (!free_streams.empty()) {
@@ -388,6 +398,19 @@ void Scheduler::DispatchStream() {
         recorder_cv.notify_one();
     }
     stream = next ? std::move(next) : std::make_unique<CommandStream>();
+}
+
+void Scheduler::WaitForRecorderRoom(std::unique_lock<std::mutex>& lock) {
+    // A first-use compile can hold the recorder at a retained bind. Bound the producer's
+    // lead to 64 batches (normally 256 commands each), instead of retaining unlimited frames.
+    static constexpr size_t MaxQueuedBatches = 64;
+    if (Common::Perf::GetTuning().compute_compile_parallel.load(std::memory_order_relaxed) &&
+        recorder_jobs.size() >= MaxQueuedBatches) {
+        const u64 start = Common::Perf::NowNs();
+        recorder_space_cv.wait(lock, [this] { return recorder_jobs.size() < MaxQueuedBatches; });
+        Common::Perf::Add(Common::Perf::ComputeCompileQueueWaitNs,
+                          Common::Perf::NowNs() - start);
+    }
 }
 
 void Scheduler::SyncRecorder() {
@@ -439,6 +462,7 @@ void Scheduler::RecorderThread(std::stop_token stoken) {
             recorder_queued.fetch_sub(1, std::memory_order_relaxed);
             recorder_busy = true;
         }
+        recorder_space_cv.notify_one();
         const u64 busy_start = Common::Perf::NowNs();
         if (job.stream && !job.stream->Empty()) {
             job.stream->Execute(RecorderCommandBuffer());
@@ -714,6 +738,8 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
         {
             std::scoped_lock lk{submit_mutex};
             if (on_submit) {
+                const bool previous = std::exchange(in_submit_callback, true);
+                SCOPE_EXIT { in_submit_callback = previous; };
                 on_submit(info);
             }
         }
@@ -731,7 +757,8 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
             std::unique_ptr<CommandStream> next;
             bool wake;
             {
-                std::scoped_lock lk{recorder_mutex};
+                std::unique_lock lk{recorder_mutex};
+                WaitForRecorderRoom(lk);
                 if (stream && !stream->Empty()) {
                     Common::Perf::Add(Common::Perf::RecorderJobs);
                     Common::Perf::Add(Common::Perf::RecorderCommands, stream->NumCommands());
@@ -772,6 +799,8 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
 #endif
 
     if (on_submit) {
+        const bool previous = std::exchange(in_submit_callback, true);
+        SCOPE_EXIT { in_submit_callback = previous; };
         on_submit(info);
     }
 
@@ -913,7 +942,7 @@ void Scheduler::ProfileSessionSubmitted(u64 tick) {
 
 void Scheduler::ProfileDispatchBegin(u64 shader_hash) {
     if (!profile || !profile->current.active ||
-        Common::Perf::GetTuning().gpu_profile.load(std::memory_order_relaxed) < 2) {
+        Common::Perf::GetTuning().gpu_profile.load(std::memory_order_relaxed) != 2) {
         return;
     }
     GpuProfile& prof = *profile;
@@ -923,6 +952,7 @@ void Scheduler::ProfileDispatchBegin(u64 shader_hash) {
     }
     prof.open_dispatch = number;
     prof.open_hash = shader_hash;
+    prof.open_graphics = false;
     // Written once the work before the dispatch is done.
     Recorder().Record([pool = prof.pool, index = prof.Index(number)](vk::CommandBuffer c) {
         c.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, pool, index);
@@ -943,10 +973,31 @@ void Scheduler::ProfileDispatchEnd() {
         .begin = begin,
         .end = number,
         .hash = prof.open_hash,
+        .graphics = prof.open_graphics,
     });
     Recorder().Record([pool = prof.pool, index = prof.Index(number)](vk::CommandBuffer c) {
         c.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, pool, index);
     });
+}
+
+void Scheduler::ProfileDrawBegin(u64 shader_hash) {
+    if (!profile || !profile->current.active ||
+        Common::Perf::GetTuning().gpu_profile.load(std::memory_order_relaxed) != 3) return;
+    auto& prof = *profile;
+    const u64 seen = prof.graphics_seen[shader_hash]++;
+    if ((seen & 31) != 0) return;
+    u64 number;
+    if (!prof.Allocate(number)) return;
+    prof.open_dispatch = number;
+    prof.open_hash = shader_hash;
+    prof.open_graphics = true;
+    Recorder().Record([pool = prof.pool, index = prof.Index(number)](vk::CommandBuffer c) {
+        c.writeTimestamp(vk::PipelineStageFlagBits::eBottomOfPipe, pool, index);
+    });
+}
+
+void Scheduler::ProfileDrawEnd() {
+    ProfileDispatchEnd();
 }
 
 void Scheduler::CollectProfile() {
@@ -1004,6 +1055,12 @@ void Scheduler::CollectProfile() {
                     continue;
                 }
                 const u64 ns = to_ns(finish - begin);
+                if (dispatch.graphics) {
+                    auto& [draw_ns, count] = prof.graphics_ns[dispatch.hash];
+                    draw_ns += ns;
+                    ++count;
+                    continue;
+                }
                 auto& [shader_ns, shader_count] = prof.shader_ns[dispatch.hash];
                 shader_ns += ns;
                 ++shader_count;
@@ -1019,6 +1076,26 @@ void Scheduler::CollectProfile() {
     }
     const double seconds = static_cast<double>(now - prof.report_start_ns) / 1e9;
     prof.report_start_ns = now;
+    if (!prof.graphics_seen.empty()) {
+        struct Row { u64 hash, seen, count; double estimate, mean; };
+        std::vector<Row> rows;
+        for (const auto& [hash, stats] : prof.graphics_ns) {
+            const u64 seen = prof.graphics_seen[hash];
+            if (!stats.second || !seen) continue;
+            const double mean = static_cast<double>(stats.first) / stats.second;
+            rows.push_back({hash, seen, stats.second, mean * seen, mean});
+        }
+        std::ranges::sort(rows, std::greater{}, &Row::estimate);
+        for (size_t i = 0; i < std::min<size_t>(rows.size(), 10); ++i) {
+            const auto& row = rows[i];
+            LOG_INFO(Render_Vulkan, "Perf GPU graphics sampled {:016x}: estimated {:.2f} ms/s, "
+                                   "{:.0f} draw commands/s, {} samples, {:.1f} us/sample",
+                     row.hash, row.estimate / 1e6 / seconds, row.seen / seconds, row.count,
+                     row.mean / 1e3);
+        }
+        prof.graphics_ns.clear();
+        prof.graphics_seen.clear();
+    }
     if (prof.shader_ns.empty()) {
         return;
     }

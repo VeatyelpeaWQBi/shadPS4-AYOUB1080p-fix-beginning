@@ -6,6 +6,7 @@
 #include "common/perf_stats.h"
 #include "shader_recompiler/info.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
+#include "video_core/renderer_vulkan/vk_driver_cache.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 
@@ -16,7 +17,8 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
                                  vk::PipelineCache pipeline_cache, ComputePipelineKey compute_key_,
                                  const Shader::Info& info_, vk::ShaderModule module_,
                                  SerializationSupport& sdata, bool preloading /*=false*/,
-                                 bool defer_compile /*=false*/)
+                                 bool defer_compile /*=false*/,
+                                 std::span<const u32> cached_image_bindings /*={}*/)
     : Pipeline{instance, scheduler, desc_heap, profile, pipeline_cache, true},
       compute_key{compute_key_}, module{module_}, vk_pipeline_cache{pipeline_cache} {
     auto& info = stages[int(Shader::SwStage::Compute)];
@@ -38,8 +40,13 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
             .stageFlags = vk::ShaderStageFlagBits::eCompute,
         });
     }
-    for (const auto& image : info->images) {
-        const u32 num_bindings = image.NumBindings(*info);
+    ASSERT(!preloading || cached_image_bindings.size() == info->images.size());
+    for (size_t image_index = 0; image_index < info->images.size(); ++image_index) {
+        const auto& image = info->images[image_index];
+        // A restored permutation may have a different mip count from the program's first
+        // flattened table. Its own specialization owns the exact layout count.
+        const u32 num_bindings =
+            preloading ? cached_image_bindings[image_index] : image.NumBindings(*info);
         bindings.push_back({
             .binding = binding,
             .descriptorType = image.is_written ? vk::DescriptorType::eStorageImage
@@ -120,14 +127,18 @@ void ComputePipeline::Compile() {
         .layout = *pipeline_layout,
     };
     const auto device = instance.GetDevice();
+    auto access =
+        driver_cache ? driver_cache->Acquire() : DriverPipelineCache::Lease{{}, vk_pipeline_cache};
     auto [pipeline_result, pipe] =
-        device.createComputePipelineUnique(vk_pipeline_cache, compute_pipeline_ci);
+        device.createComputePipelineUnique(access.cache, compute_pipeline_ci);
     ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create compute pipeline: {}",
                vk::to_string(pipeline_result));
     pipeline = std::move(pipe);
     SetObjectName(device, *pipeline, "Compute Pipeline {}", GetDebugString());
     Common::Perf::Add(Common::Perf::PipelineCreates);
     Common::Perf::Add(Common::Perf::PipelineCreateNs, Common::Perf::NowNs() - start_ns);
+    if (driver_cache)
+        driver_cache->Compiled();
     MarkReady();
 }
 

@@ -69,6 +69,9 @@ public:
         return *rasterizer.get();
     }
 
+    /// Flush persistent caches even when the frontend uses quick_exit.
+    void SavePipelineCache();
+
     bool IsHDRSupported() const {
         return swapchain.HasHDR();
     }

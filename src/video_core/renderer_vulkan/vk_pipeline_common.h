@@ -3,10 +3,9 @@
 
 #pragma once
 
-#include <atomic>
-
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/runtime_info.h"
+#include "video_core/compile_readiness.h"
 #include "video_core/renderer_vulkan/vk_common.h"
 
 #include <boost/container/small_vector.hpp>
@@ -26,6 +25,7 @@ static constexpr auto AllGraphicsStageBits =
 class Instance;
 class Scheduler;
 class DescriptorHeap;
+class DriverPipelineCache;
 
 class Pipeline {
 public:
@@ -67,6 +67,16 @@ public:
     void BindResources(Scheduler& on, DescriptorWrites& set_writes,
                        const Shader::PushData& push_data) const;
 
+    /// Retained compute work waits at command replay, preserving every dispatch and its order.
+    void BindCompute(Scheduler& on) const;
+
+    void RetainComputeWork() noexcept {
+        retained_compute_work = true; // Set before publication to the compiler/recorder.
+    }
+    [[nodiscard]] bool RetainsComputeWork() const noexcept {
+        return retained_compute_work;
+    }
+
     /// Whether the descriptors are pushed (no descriptor set allocated per bind).
     [[nodiscard]] bool UsesPushDescriptors() const noexcept {
         return uses_push_descriptors;
@@ -75,18 +85,19 @@ public:
     /// Returns true once the Vulkan pipeline object exists. A pipeline whose creation was
     /// deferred is compiled by a worker thread and must not be bound before that.
     [[nodiscard]] bool IsReady() const noexcept {
-        return ready.load(std::memory_order_acquire);
+        return readiness.IsReady();
     }
 
     /// Creates the Vulkan pipeline object when the constructor deferred it. Called exactly once,
-    /// from any thread, while no other thread uses the pipeline.
+    /// from any thread. The layout is immutable; the handle is published with MarkReady().
     virtual void Compile() = 0;
+    void SetDriverCache(DriverPipelineCache* cache) { driver_cache = cache; }
 
 protected:
     [[nodiscard]] std::string GetDebugString() const;
 
     void MarkReady() noexcept {
-        ready.store(true, std::memory_order_release);
+        readiness.Publish();
     }
 
     const Instance& instance;
@@ -99,7 +110,9 @@ protected:
     std::array<const Shader::Info*, Shader::MaxStageTypes> stages{};
     bool uses_push_descriptors{};
     bool is_compute;
-    std::atomic<bool> ready{false};
+    VideoCore::CompileReadiness readiness;
+    bool retained_compute_work{};
+    DriverPipelineCache* driver_cache{};
 };
 
 } // namespace Vulkan

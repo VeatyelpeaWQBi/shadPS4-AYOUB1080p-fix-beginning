@@ -245,7 +245,6 @@ struct DynamicState {
 
         /// Notes a pipeline bind; true when it can be left out (already bound, skipping on).
         bool SkipPipeline(vk::PipelineBindPoint bind_point, vk::Pipeline pipeline) noexcept;
-
         /// Notes constants pushed; true when they can be left out (same layout, stages, range
         /// and values as the last push of these stages, skipping on).
         bool SkipPush(vk::PipelineLayout layout, vk::ShaderStageFlags stages, u32 offset, u32 size,
@@ -602,6 +601,8 @@ public:
     /// gpu_profile = 2: GPU timestamps around a compute dispatch, counted for its shader.
     void ProfileDispatchBegin(u64 shader_hash);
     void ProfileDispatchEnd();
+    void ProfileDrawBegin(u64 shader_hash);
+    void ProfileDrawEnd();
 
     /// gpu_profile: reads the timestamps of the submissions the GPU has finished (command
     /// processor thread, once per guest frame).
@@ -669,6 +670,7 @@ private:
     void DispatchStream();
     /// Waits until the recording thread has recorded and submitted all it was given.
     void SyncRecorder();
+    void WaitForRecorderRoom(std::unique_lock<std::mutex>& lock);
     /// The command buffer of the session recorded by the recording thread (begun when needed).
     /// Recording thread, or command processor while the recording thread is idle.
     vk::CommandBuffer RecorderCommandBuffer();
@@ -730,6 +732,7 @@ private:
     std::mutex recorder_mutex;
     std::condition_variable_any recorder_cv;
     std::condition_variable_any recorder_idle_cv;
+    std::condition_variable recorder_space_cv;
     std::deque<RecorderJob> recorder_jobs;
     std::vector<std::unique_ptr<CommandStream>> free_streams;
     bool recorder_busy{};

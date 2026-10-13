@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "core/perf_sampler.h"
+#include "core/benchmark_control.h"
 
 #include <algorithm>
 #include <array>
@@ -50,6 +51,7 @@ void ApplyGameProfile(std::string_view serial) {
     t.readback_write_discard.store(true, relaxed);
     t.readback_write_discard_from_ini.store(true, relaxed);
     t.async_pipelines.store(1, relaxed);
+    t.compute_compile_parallel.store(true, relaxed);
     t.readback_queue.store(true, relaxed);
     t.stream_dedup.store(true, relaxed);
     t.stream_static.store(true, relaxed);
@@ -59,6 +61,7 @@ void ApplyGameProfile(std::string_view serial) {
     t.wave_memory_barriers.store(true, relaxed);
     t.threaded_recording.store(true, relaxed);
     t.async_uploads.store(true, relaxed);
+    t.staging_budget_auto.store(true, relaxed);
     t.recorder_spin_us.store(200, relaxed);
     t.sync_memo.store(true, relaxed);
     t.spec_memo.store(true, relaxed);
@@ -91,7 +94,9 @@ void PollTuning() {
     }
     next_check = now + std::chrono::seconds{1};
 
-    const auto path = Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "perf_tuning.ini";
+    const auto path = Core::Benchmark::Enabled()
+                          ? Core::Benchmark::TuningPath()
+                          : Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "perf_tuning.ini";
     std::error_code error;
     const auto write_time = std::filesystem::last_write_time(path, error);
     if (error) {
@@ -140,8 +145,12 @@ void PollTuning() {
             tuning.readback_keep_ranges.store(value != "0", std::memory_order_relaxed);
         } else if (key == "threaded_recording") {
             tuning.threaded_recording.store(value != "0", std::memory_order_relaxed);
+        } else if (key == "compute_compile_parallel") {
+            tuning.compute_compile_parallel.store(value != "0", std::memory_order_relaxed);
         } else if (key == "async_uploads") {
             tuning.async_uploads.store(value != "0", std::memory_order_relaxed);
+        } else if (key == "staging_budget_auto") {
+            tuning.staging_budget_auto.store(value != "0", std::memory_order_relaxed);
         } else if (key == "sync_memo") {
             tuning.sync_memo.store(value != "0", std::memory_order_relaxed);
         } else if (key == "region_summary") {
@@ -207,7 +216,7 @@ void PollTuning() {
             tuning.asc_queue.store(value != "0", std::memory_order_relaxed);
         } else if (key == "gpu_profile") {
             tuning.gpu_profile.store(
-                static_cast<u32>(std::min<u64>(std::strtoull(value.c_str(), nullptr, 10), 2)),
+                static_cast<u32>(std::min<u64>(std::strtoull(value.c_str(), nullptr, 10), 3)),
                 std::memory_order_relaxed);
         } else if (key == "gpu_threads_priority") {
             tuning.gpu_threads_priority.store(
@@ -424,7 +433,8 @@ void PollTuning() {
              "cpu_affinity={:#x} scout_fast={} pipeline_key_memo={} bind_prefetch={} "
              "gpu_threads_affinity={:#x} other_threads_affinity={:#x} rt_memo={} "
              "late_protect={} parallel_protect={} gpu_threads_priority={} gpu_profile={} "
-             "readback_relaxed_sites={} asc_queue={} runtime_lookup_memo={}",
+             "readback_relaxed_sites={} asc_queue={} runtime_lookup_memo={} "
+             "compute_compile_parallel={}",
              tuning.readback_window_bytes.load(std::memory_order_relaxed) / 1024,
              tuning.readback_write_discard.load(std::memory_order_relaxed),
              tuning.readback_write_merge.load(std::memory_order_relaxed),
@@ -489,7 +499,8 @@ void PollTuning() {
                  return sites.empty() ? std::string{"none"} : sites;
              }(),
              tuning.asc_queue.load(std::memory_order_relaxed),
-             tuning.runtime_lookup_memo.load(std::memory_order_relaxed));
+             tuning.runtime_lookup_memo.load(std::memory_order_relaxed),
+             tuning.compute_compile_parallel.load(std::memory_order_relaxed));
 }
 
 namespace {
@@ -1012,20 +1023,32 @@ private:
         if (wanted == applied_affinity) {
             return;
         }
-        applied_affinity = wanted;
         DWORD_PTR process_mask = 0;
         DWORD_PTR system_mask = 0;
         if (!GetProcessAffinityMask(GetCurrentProcess(), &process_mask, &system_mask)) {
             return;
         }
-        const DWORD_PTR mask =
-            wanted != 0 ? static_cast<DWORD_PTR>(wanted) & system_mask : system_mask;
+        if (original_affinity == 0) original_affinity = process_mask;
+        const DWORD_PTR mask = wanted ? static_cast<DWORD_PTR>(wanted) & system_mask
+                                      : original_affinity & system_mask;
         if (mask == 0) {
             LOG_WARNING(Debug, "Perf CPU: affinity {:#x} has no processor of this machine",
                         wanted);
             return;
         }
+        if (mask == process_mask) {
+            applied_affinity = wanted;
+            return;
+        }
         if (SetProcessAffinityMask(GetCurrentProcess(), mask)) {
+            applied_affinity = wanted;
+            // Windows can retain a thread's narrower mask when the process mask expands.
+            // Invalidate our own affinity cache so wanted=0 really restores the process mask.
+            // Ordinary launches (no explicit process change) keep existing thread affinities.
+            for (auto& [tid, info] : threads) {
+                info.affinity_process = 0;
+                if (info.affinity == 0) info.affinity = Common::Perf::AffinityAuto;
+            }
             LOG_INFO(Debug, "Perf CPU: process affinity set to logical processors {}",
                      MaskText(static_cast<u64>(mask)));
         } else {
@@ -1035,7 +1058,8 @@ private:
     }
 
     u64 applied_affinity{};
-    u64 auto_gpu_mask{}; ///< gpu_threads_affinity = auto, see AutoGpuThreadsMask.
+    u64 original_affinity{};
+    u64 auto_gpu_mask{};       ///< gpu_threads_affinity = auto, see AutoGpuThreadsMask.
     u32 other_threads_moved{}; ///< Threads given other_threads_affinity since the last log.
 
     /// The emulator threads translating the graphics commands (gpu_threads_affinity).

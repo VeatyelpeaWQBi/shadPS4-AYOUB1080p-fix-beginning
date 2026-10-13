@@ -952,6 +952,8 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/platform.h
          src/core/perf_sampler.cpp
          src/core/perf_sampler.h
+         src/core/benchmark_control.cpp
+         src/core/benchmark_control.h
          src/core/signals.cpp
          src/core/signals.h
          src/core/thread.cpp
@@ -1135,6 +1137,10 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/vk_instance.h
                src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
                src/video_core/renderer_vulkan/vk_pipeline_cache.h
+               src/video_core/renderer_vulkan/vk_driver_cache.cpp
+               src/video_core/renderer_vulkan/vk_driver_cache.h
+               src/video_core/renderer_vulkan/vk_driver_cache_format.h
+               src/video_core/renderer_vulkan/vk_prewarm_budget.h
                src/video_core/renderer_vulkan/vk_pipeline_common.cpp
                src/video_core/renderer_vulkan/vk_pipeline_common.h
                src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp
@@ -1185,6 +1191,10 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/cache_storage.cpp
                src/video_core/cache_storage.h
                src/video_core/runtime_memo.h
+               src/video_core/cache_file.cpp
+               src/video_core/cache_file.h
+               src/video_core/cache_writer.h
+               src/video_core/compile_readiness.h
                src/video_core/page_manager.cpp
                src/video_core/page_manager.h
                src/video_core/renderdoc.cpp
@@ -1367,6 +1377,10 @@ endif()
 
 if (WIN32)
     target_link_libraries(shadps4 PRIVATE mincore wepoll wbemuuid)
+    option(SHADPS4_DIAGNOSTIC_MAP "Emit a local Release linker map for CPU profiling" OFF)
+    if (MSVC AND SHADPS4_DIAGNOSTIC_MAP)
+        target_link_options(shadps4 PRIVATE "/MAP:${CMAKE_CURRENT_BINARY_DIR}/shadps4.map")
+    endif()
 
     if (MSVC)
         # MSVC likes putting opinions on what people can use, disable:

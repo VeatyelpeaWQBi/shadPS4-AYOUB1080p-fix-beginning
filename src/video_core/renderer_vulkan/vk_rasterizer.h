@@ -446,7 +446,6 @@ private:
     u32 set_write_index{};
     Pipeline::DescriptorWrites set_writes;
     Shader::PushData push_data;
-
     /// Immutable flattened resource tables uploaded in the current stream submission.
     /// Contents are compared on every use; bounded to 64 * 4 KiB, command processor only.
     std::array<VideoCore::RuntimeUploadMemo<4096>, 64> flatbuf_upload_memos;

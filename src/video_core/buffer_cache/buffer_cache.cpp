@@ -5,10 +5,12 @@
 #include <array>
 #include <bit>
 #include <chrono>
+#include <cstring>
 #include <string>
 #include <magic_enum/magic_enum.hpp>
 
 #include "common/alignment.h"
+#include "common/elf_info.h"
 #include "common/memory_patcher.h"
 #include "common/perf_stats.h"
 #include "common/scope_exit.h"
@@ -185,6 +187,7 @@ void UploadWorker::ExecuteQueued() {
     }
     const u64 start_ns = Common::Perf::NowNs();
     // First the protections of all the jobs, merged (fewer system calls)...
+    const bool profile_upload = Common::Perf::GetTuning().perf_log.load(std::memory_order_relaxed);
     ranges.clear();
     for (const Job& job : batch) {
         ranges.insert(ranges.end(), job.pages.begin(), job.pages.end());
@@ -200,6 +203,9 @@ void UploadWorker::ExecuteQueued() {
         num_pages += page_manager.RefreshDeferredProtect(first, end);
     }
     // ... then the copies: a guest write to these pages from now on faults.
+    const u64 copy_start_ns = profile_upload ? Common::Perf::NowNs() : 0;
+    if (profile_upload)
+        Common::Perf::Add(Common::Perf::UploadProtectionNs, copy_start_ns - start_ns);
     auto* const memory = Core::Memory::Instance();
     u64 num_bytes = 0;
     for (const Job& job : batch) {
@@ -213,6 +219,8 @@ void UploadWorker::ExecuteQueued() {
     }
     Common::Perf::Add(Common::Perf::AsyncUploadJobs, batch.size());
     Common::Perf::Add(Common::Perf::AsyncUploadBytes, num_bytes);
+    if (profile_upload)
+        Common::Perf::Add(Common::Perf::UploadCopyNs, Common::Perf::NowNs() - copy_start_ns);
     Common::Perf::Add(Common::Perf::AsyncUploadPages, num_pages);
     batch.clear();
     completed.store(last_seq, std::memory_order_release);
@@ -1810,15 +1818,19 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
     boost::container::small_vector<std::pair<VAddr, VAddr>, 4> guest_owned;
     // Upload worker: the pages uploaded here are protected again by the worker, which copies
     // them only afterwards (no write merge or hot pages). Ranges the GPU writes too
-    // (async_written_uploads): their read protection is applied by the worker as well, before
-    // the submission of the commands writing them, so before the guest can wait for them.
+    // (async_written_uploads): HK must apply read protection now. Translated fences can let
+    // the guest read particle feedback before the worker applies a deferred protection;
+    // that read would see stale CPU bytes and never request the required GPU readback.
     const bool async_upload =
         !merge && !hash_hot_pages && tuning.hot_page_faults.load(std::memory_order_relaxed) == 0 &&
         tuning.async_uploads.load(std::memory_order_relaxed) &&
         (!is_written || tuning.async_written_uploads.load(std::memory_order_relaxed));
+    // Keep the original policy for other regions; staging copies still run on the worker.
+    const bool defer_protection = async_upload &&
+        !(is_written && Common::ElfInfo::Instance().GameSerial() == "CUSA00309");
     if (async_upload) {
         deferred_pages.clear();
-        PageManager::DeferProtect(&deferred_pages);
+        if (defer_protection) PageManager::DeferProtect(&deferred_pages);
     }
     memory_tracker->ForEachUploadRange(
         device_addr, size, is_written, [&](u64 addr, u64 size, auto&& keep_gpu_owned) {
@@ -1886,7 +1898,7 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
                 add_copy(run_start, end - run_start);
             }
         });
-    if (async_upload) {
+    if (defer_protection) {
         PageManager::DeferProtect(nullptr);
     }
     for (const auto [lo, hi] : guest_owned) {

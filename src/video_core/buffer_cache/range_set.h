@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <array>
+
 #include <boost/icl/discrete_interval.hpp>
 #include <boost/icl/interval_map.hpp>
 #include <boost/icl/split_interval_map.hpp>
@@ -30,18 +32,29 @@ struct RangeSet {
     ~RangeSet() = default;
 
     void Add(VAddr base_address, size_t size) {
+        if (size == 0) return;
         const VAddr end_address = base_address + size;
+        auto& known = known_adds[((base_address >> 12) * 0x9E3779B97F4A7C15ULL) >> (64 - 6)];
+        // Add never removes data. A range added successfully since the last subtraction is
+        // still contained in the set, so inserting it (or a subrange) again is a no-op.
+        if (known.epoch == subtract_epoch && base_address >= known.start &&
+            end_address <= known.end) {
+            return;
+        }
         IntervalType interval{base_address, end_address};
         m_ranges_set.add(interval);
+        known = KnownAdd{base_address, end_address, subtract_epoch};
     }
 
     void Subtract(VAddr base_address, size_t size) {
+        ++subtract_epoch;
         const VAddr end_address = base_address + size;
         IntervalType interval{base_address, end_address};
         m_ranges_set.subtract(interval);
     }
 
     void Clear() {
+        ++subtract_epoch;
         m_ranges_set.clear();
     }
 
@@ -110,7 +123,14 @@ struct RangeSet {
         }
     }
 
+private:
     IntervalSet m_ranges_set;
+    struct KnownAdd {
+        VAddr start{}, end{};
+        u64 epoch{};
+    };
+    std::array<KnownAdd, 64> known_adds{};
+    u64 subtract_epoch{1};
 };
 
 template <typename T>

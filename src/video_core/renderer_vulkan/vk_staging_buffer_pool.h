@@ -11,6 +11,7 @@
 
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
+#include "video_core/renderer_vulkan/vk_prewarm_budget.h"
 
 namespace Vulkan {
 
@@ -88,6 +89,10 @@ private:
     mutable std::mutex large_mutex;
     std::array<std::vector<LargeBuffer>, NUM_TYPES> large_caches;
     std::atomic<u64> frame{0};
+    std::atomic<u64> allocated_bytes{0};
+    PrewarmBudget budget;
+    u64 keep_bytes{};
+    bool automatic_budget{};
 };
 
 } // namespace Vulkan

@@ -3,12 +3,14 @@
 
 #pragma once
 
-#include "common/assert.h"
 #include "common/types.h"
 
+#include <concepts>
 #include <cstddef>
 #include <cstring>
+#include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace Serialization {
@@ -44,9 +46,14 @@ struct Archive {
     }
 
     void Advance(size_t size) {
-        ASSERT_MSG(offset + size <= container.size(),
-                   "Invalid or corrupted deserialization container/shader cache");
+        if (size > Remaining()) {
+            throw std::runtime_error("Truncated serialization archive");
+        }
         offset += size;
+    }
+
+    [[nodiscard]] size_t Remaining() const {
+        return container.size() - offset;
     }
 
     std::vector<u8>&& TakeOff() {
@@ -59,10 +66,10 @@ struct Archive {
     }
 
     Archive() = default;
-    explicit Archive(std::vector<u8>&& v) : container{v} {}
+    explicit Archive(std::vector<u8>&& v) : container{std::move(v)} {}
 
 private:
-    u32 offset{};
+    size_t offset{};
     std::vector<u8> container{};
 
     friend struct Writer;
@@ -107,8 +114,9 @@ struct Writer {
 struct Reader {
     template <typename T>
     void Read(T* ptr, size_t size) {
-        ASSERT_MSG(ar.offset + size <= ar.container.size(),
-                   "Invalid or corrupted deserialization container/shader cache");
+        if (size > ar.Remaining()) {
+            throw std::runtime_error("Truncated serialization archive");
+        }
         std::memcpy(reinterpret_cast<void*>(ptr), ar.CurrPtr(), size);
         ar.Advance(size);
     }
@@ -123,7 +131,10 @@ struct Reader {
     void Read(auto& v) {
         size_t num_elements{};
         Read(num_elements);
-        for (int i = 0; i < num_elements; ++i) {
+        if (num_elements > ar.Remaining() || num_elements > 1'000'000) {
+            throw std::runtime_error("Invalid serialization element count");
+        }
+        for (size_t i = 0; i < num_elements; ++i) {
             v.emplace_back();
             Read(v.back());
         }
@@ -132,6 +143,9 @@ struct Reader {
     void Read(std::string& s) {
         size_t length{};
         Read(length);
+        if (length > ar.Remaining()) {
+            throw std::runtime_error("Invalid serialization string length");
+        }
         s.resize(length);
         Read(s.data(), length);
     }
