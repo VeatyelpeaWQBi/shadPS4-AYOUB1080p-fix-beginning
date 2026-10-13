@@ -3,8 +3,8 @@
 # Run explicitly from the user's existing PowerShell environment. No tools are installed.
 [CmdletBinding()]
 param(
-    [string]$EmulatorPath = 'D:\game\shadPS4-AYOUB1080p-1.0-windows-x64\shadPS4-AYOUB1080p-1.0\shadps4.exe',
-    [string]$GameDirectory = 'D:\game\shadPS4QtLauncher\games\CUSA00309',
+    [Parameter(Mandatory)][string]$EmulatorPath,
+    [Parameter(Mandatory)][string]$GameDirectory,
     [string]$UserDirectory = (Join-Path $env:APPDATA 'shadPS4'),
     [ValidateSet('1080p', '1440p', '1800p', '4k')]
     [string]$Resolution = '1800p',
@@ -37,7 +37,7 @@ $repoRoot = Split-Path -Parent $PSScriptRoot
 $gameExecutable = Join-Path $GameDirectory 'eboot.bin'
 $sourcePatch = Join-Path $repoRoot 'package\user-files\patches\shadPS4-AYOUB1080p\inFAMOUS Second Son CUSA00309.xml'
 $sourceConfig = Join-Path $repoRoot 'package\user-files\custom_configs\CUSA00309.json'
-$sourceTuning = Join-Path $repoRoot 'documents\Debugging\infamous-CUSA00309-perf.ini'
+$sourceTuning = Join-Path $PSScriptRoot 'infamous_hk.ini'
 foreach ($inputPath in @($EmulatorPath, $gameExecutable, $sourcePatch, $sourceConfig, $sourceTuning)) {
     if (-not (Test-Path -LiteralPath $inputPath -PathType Leaf)) {
         throw "Required file does not exist: $inputPath"
@@ -108,7 +108,7 @@ function Merge-ConfigGroups($destination, $overrides) {
     }
 }
 
-function Get-LaunchExitDetails($process, $startedAt, $userPath) {
+function Get-LaunchExitDetails($process, $startedAt) {
     $process.WaitForExit()
     $message = 'Simulator exited (exit code {0}).' -f $process.ExitCode
     foreach ($logName in @('shadps4.log', 'CUSA00309.log')) {
@@ -227,10 +227,6 @@ if ($Performance) {
         General = [PSCustomObject]@{ dev_kit_mode = $false }
         Debug = [PSCustomObject]@{ debug_dump = $false; shader_collect = $false }
         Input = [PSCustomObject]@{ motion_controls_enabled = $true }
-        Log = [PSCustomObject]@{
-            enable = $true; filter = '*:error'; separate = $true; sync = $false
-            skip_duplicate = $true; size_limit = 16777216; append = $false
-        }
         GPU = [PSCustomObject]@{
             copy_gpu_buffers = $false; vblank_frequency = 60
             full_screen = $true; full_screen_mode = 'Fullscreen (Borderless)'
@@ -244,28 +240,18 @@ if ($Performance) {
         }
     })
 }
-if ($Diagnostic) {
+if ($Performance -or $Diagnostic -or $CacheDiagnostic) {
+    $logFilter = if ($PerformanceDiagnostic) {
+        '*:warning Config:info Debug:info Render:info Render_Vulkan:info Core.Linker:info'
+    } elseif ($Diagnostic) {
+        '*:info Input:debug'
+    } elseif ($CacheDiagnostic) {
+        '*:warning Render:info Render_Vulkan:info Debug:info'
+    } else { '*:error' }
     Merge-ConfigGroups $config ([PSCustomObject]@{
         Log = [PSCustomObject]@{
-            enable = $true; filter = '*:info Input:debug'; separate = $true; sync = $true
-            skip_duplicate = $true; size_limit = 16777216; append = $false
-        }
-    })
-}
-if ($CacheDiagnostic -and -not $Diagnostic) {
-    Merge-ConfigGroups $config ([PSCustomObject]@{
-        Log = [PSCustomObject]@{
-            enable = $true; filter = '*:warning Render:info Render_Vulkan:info Debug:info'; separate = $true
-            sync = $false; skip_duplicate = $true; size_limit = 16777216; append = $false
-        }
-    })
-}
-if ($PerformanceDiagnostic) {
-    Merge-ConfigGroups $config ([PSCustomObject]@{
-        Log = [PSCustomObject]@{
-            enable = $true
-            filter = '*:warning Config:info Debug:info Render:info Render_Vulkan:info Core.Linker:info'
-            separate = $true; sync = $false; skip_duplicate = $true
+            enable = $true; filter = $logFilter; separate = $true; sync = [bool]$Diagnostic
+            skip_duplicate = $true
             size_limit = 16777216; append = $false
         }
     })
@@ -447,7 +433,7 @@ try {
     # Retain the handle so Windows PowerShell can report ExitCode after the process exits.
     $null = $gameProcess.Handle
     if ($gameProcess.WaitForExit(1500)) {
-        throw (Get-LaunchExitDetails $gameProcess $launchStartedAt $UserDirectory)
+        throw (Get-LaunchExitDetails $gameProcess $launchStartedAt)
     }
     if ($Diagnostic) {
         $null = Read-Host 'When the opening reaches the sky or an interactive prompt, return here and press Enter'
@@ -456,7 +442,7 @@ try {
             [IO.File]::WriteAllText($tuningPath, $tuning.Replace('dump_frames = 0', 'dump_frames = 2'), $utf8)
             Write-Host 'Two-frame command capture requested. Keep the scene running for at least 40 seconds, then close the game normally.'
         } else {
-            Write-Warning ((Get-LaunchExitDetails $gameProcess $launchStartedAt $UserDirectory) + ' No two-frame capture was made.')
+            Write-Warning ((Get-LaunchExitDetails $gameProcess $launchStartedAt) + ' No two-frame capture was made.')
         }
     }
     if ($PerformanceDiagnostic) {
@@ -480,7 +466,7 @@ try {
         $gameProcess.WaitForExit()
     }
     if ($gameProcess.ExitCode -ne 0) {
-        throw (Get-LaunchExitDetails $gameProcess $launchStartedAt $UserDirectory)
+        throw (Get-LaunchExitDetails $gameProcess $launchStartedAt)
     }
     if ($Diagnostic -or $CacheDiagnostic) {
         Write-Host ('Log: ' + (Join-Path $nativeLogDirectory 'CUSA00309.log'))

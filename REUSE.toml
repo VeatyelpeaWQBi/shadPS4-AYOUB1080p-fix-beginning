@@ -120,12 +120,3 @@ path = "package/**"
 precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 shadPS4-AYOUB1080p contributors"
 SPDX-License-Identifier = "GPL-2.0-or-later"
-
-[[annotations]]
-path = [
-    "documents/Debugging/infamous-CUSA00309-baseline.json",
-    "documents/Debugging/infamous-CUSA00309-audit.json",
-]
-precedence = "aggregate"
-SPDX-FileCopyrightText = "2026 shadPS4-AYOUB1080p contributors"
-SPDX-License-Identifier = "GPL-2.0-or-later"

@@ -83,15 +83,4 @@ foreach($phase in $phases) {
     $results.Add($summary)
     [IO.File]::WriteAllText((Join-Path $run ($Tag+'-comparison.json')),($results|ConvertTo-Json -Depth 4),[Text.UTF8Encoding]::new($false))
     $summary|ConvertTo-Json -Compress
-    if($phase.PSObject.Properties['capture_frames'] -and [int]$phase.capture_frames-gt0) {
-        $captureTag=$Tag+'-'+$phase.name
-        $interval=if($phase.PSObject.Properties['capture_interval_ms']) {[int]$phase.capture_interval_ms}else{800}
-        & (Join-Path $PSScriptRoot 'capture_infamous_animation.ps1') -RunName $RunName -Tag $captureTag -Frames ([int]$phase.capture_frames) -IntervalMs $interval -CompressEachFrame
-        $python='C:\Users\USER\AppData\Local\Programs\Python\Python312\python.exe'
-        if(-not(Test-Path -LiteralPath $python)) {throw 'Installed Python is missing.'}
-        & $python -B (Join-Path $PSScriptRoot 'analyze_infamous_fire_sequence.py') (Join-Path $run ($captureTag+'-capture.csv'))
-        if($LASTEXITCODE-ne0) {throw 'Animation analysis failed.'}
-        & $python -B (Join-Path $PSScriptRoot 'compress_infamous_captures.py') $RunName
-        if($LASTEXITCODE-ne0) {throw 'Lossless capture verification failed.'}
-    }
 }

@@ -57,7 +57,7 @@ on both official 0.19.0 and AYOUB 1.0 reached the spray tutorial after enabling 
 Complete playability and stable 4K/60 FPS remain unverified.
 Mouse motion (orientation and shake), mouse-button single/two-finger contacts, and Windows
 Precision Touchpad input have also been ported from the user's local engine. These source changes
-need a new build and runtime validation; see the [input controls and checks](documents/Debugging/infamous-mouse-input-port.md).
+need a new build and runtime validation; see [controls and validation](#hk-controls-and-validation).
 The executable patches below cover European CUSA00004 APP_VER 01.00 and the analyzed Hong Kong
 CUSA00309 APP_VER 01.07 executable. Other regional revisions are not covered by these patch files.
 
@@ -68,8 +68,7 @@ The `user-files\patches\shadPS4-AYOUB1080p\` directory contains two separate pat
 - `inFAMOUS Second Son.xml`: European CUSA00004, APP_VER 01.00.
 - `inFAMOUS Second Son CUSA00309.xml`: Hong Kong CUSA00309, APP_VER 01.07. All 48 lines of the
   11 patches below match the original-byte hashes in the analyzed executable; collision payload
-  branches, writable counter storage and FOV references were also checked. See the
-  [Hong Kong analysis and launch instructions](documents/Debugging/infamous-CUSA00309-adaptation.md).
+  branches, writable counter storage and FOV references were also checked.
 
 Both files offer the following patches and defaults:
 
@@ -139,7 +138,32 @@ As for shadPS4: clone with the submodules (`git clone --recursive`), then follow
 For an already prepared Windows checkout, double-click [`build.bat`](build.bat) for an incremental
 Release build, or run `scripts\build_release.ps1 -RunCacheTests` to include the cache tests.
 The script reuses installed tools and existing dependencies without downloading them.
-See the [local build instructions](documents/Debugging/windows-local-build.md) (Chinese).
+
+### HK controls and validation
+
+- F6 toggles mouse motion; move to change orientation, move back and forth to shake, and hold
+  the left button to spray (R2).
+- Delete toggles touchpad emulation. Left/right mouse buttons produce contacts; holding both
+  produces two contacts. The right button also presses the touchpad button. Windows Precision
+  Touchpads can supply native contacts while this mode is enabled.
+- Home centers the input; Escape releases it. Losing focus also releases emulated input.
+- F7 joystick emulation and physical gamepad input remain available.
+
+Run `scripts\run_infamous_hk.ps1 -EmulatorPath <exe> -GameDirectory <CUSA00309> -Performance`
+to apply the HK profile temporarily; `-Resolution 1080p|1440p|1800p|4k` selects rendering size.
+The launcher checks the analyzed 01.07 executable hash and restores previous configuration,
+patch and tuning files on exit. `-PerformanceDiagnostic -LightProfile` records bounded diagnostics;
+`-RuntimeLookupBaseline` and `-ComputeCompileBaseline` allow comparisons with those paths disabled.
+
+`scripts\build_release.ps1 -RunCacheTests` builds the emulator and runs the cache, synchronization,
+buffer access, runtime lookup and input regression tests using existing tools and dependencies.
+Alternatively, configure `tests/cache_runtime` with your installed CMake and C++23 compiler,
+build it, then run `ctest --test-dir <build-directory> --output-on-failure`.
+
+Before submitting changes, validate cold/warm cache launches, cache recovery, normal shutdown,
+mouse/native input transitions, and the affected scenes on CUSA00309, CUSA00004 and CUSA00223.
+Patch payloads remain region/version specific; other games retain their default tuning.
+CPU-only regression checks do not establish game compatibility or stable frame rates.
 
 ### License
 
@@ -199,7 +223,7 @@ Le dossier `user-files\patches\shadPS4-AYOUB1080p\` contient deux fichiers disti
 - `inFAMOUS Second Son CUSA00309.xml` : CUSA00309 Hong Kong, APP_VER 01.07. Les 48 lignes des
   11 patchs correspondent aux sommes de contrôle des octets d'origine de l'exécutable analysé.
   Les sauts du correctif de collisions, le compteur et les références du champ de vision ont
-  également été vérifiés. Voir les [instructions Hong Kong](documents/Debugging/infamous-CUSA00309-adaptation.md).
+  également été vérifiés. Voir les [contrôles et la validation](#hk-controls-and-validation).
 
 Les deux fichiers proposent les patchs et valeurs par défaut suivants :
 
@@ -272,7 +296,7 @@ Comme pour shadPS4 : cloner avec les sous-modules (`git clone --recursive`), pui
 Pour un environnement Windows déjà préparé, ouvrir [`build.bat`](build.bat) pour une compilation
 Release incrémentale, ou lancer `scripts\build_release.ps1 -RunCacheTests` pour inclure les tests du
 cache. Le script réutilise les outils et dépendances installés sans les télécharger.
-Voir les [instructions locales](documents/Debugging/windows-local-build.md) (en chinois).
+Voir les [contrôles et la validation](#hk-controls-and-validation).
 
 ### Licence
 
