@@ -971,6 +971,11 @@ Shader::ShaderParams PipelineCache::GetStageParams(const ProgramRegs& pgm) {
     const u64 epoch = VideoCore::CurrentUploadEpoch();
     const u64 host_write_gen = VideoCore::CurrentHostWriteGen();
     const u64 mapping_generation = shader_mapping_generation.load(std::memory_order_acquire);
+    const auto memory_unchanged = [&] {
+        return VideoCore::CurrentUploadEpoch() == epoch &&
+               VideoCore::CurrentHostWriteGen() == host_write_gen &&
+               shader_mapping_generation.load(std::memory_order_acquire) == mapping_generation;
+    };
     const u32 set_index =
         (address * 0x9E3779B97F4A7C15ULL) >> (64 - NumParamsMemoBits);
     auto& set = params_memos[set_index];
@@ -998,9 +1003,7 @@ Shader::ShaderParams PipelineCache::GetStageParams(const ProgramRegs& pgm) {
             same_scan && (!memo.direct_header ||
                           memo.header_input.Matches({bytes + memo.header_offset,
                                                      HeaderBytes}));
-        if (same_header && VideoCore::CurrentUploadEpoch() == epoch &&
-            VideoCore::CurrentHostWriteGen() == host_write_gen &&
-            shader_mapping_generation.load(std::memory_order_acquire) == mapping_generation) {
+        if (same_header && memory_unchanged()) {
             hit = true;
             memo.epoch = epoch;
             memo.host_write_gen = host_write_gen;
@@ -1092,9 +1095,7 @@ Shader::ShaderParams PipelineCache::GetStageParams(const ProgramRegs& pgm) {
         }
         // A wait/readback while reading may have changed guest memory. Keep the original
         // epoch (so the next lookup misses), and never carry that snapshot across epochs.
-        if (VideoCore::CurrentUploadEpoch() != epoch ||
-            VideoCore::CurrentHostWriteGen() != host_write_gen ||
-            shader_mapping_generation.load(std::memory_order_acquire) != mapping_generation) {
+        if (!memory_unchanged()) {
             memo.scan_input.Invalidate();
             memo.header_input.Invalidate();
         }
@@ -1379,13 +1380,17 @@ void SpecializationInputs(const InfoT& info, const Shader::Backend::Bindings& bi
     }
 }
 
+u64 SpecializationKey(std::span<const u32> words, const Shader::RuntimeInfo& runtime_info) {
+    return HashCombine(XXH3_64bits(words.data(), words.size() * sizeof(u32)),
+                       XXH3_64bits(&runtime_info, sizeof(runtime_info)));
+}
+
 template <typename InfoT>
 u64 SpecializationKey(const InfoT& info, const Shader::RuntimeInfo& runtime_info,
                       const Shader::Backend::Bindings& binding) {
     boost::container::small_vector<u32, 160> words;
     SpecializationInputs(info, binding, words);
-    return HashCombine(XXH3_64bits(words.data(), words.size() * sizeof(u32)),
-                       XXH3_64bits(&runtime_info, sizeof(runtime_info)));
+    return SpecializationKey({words.data(), words.size()}, runtime_info);
 }
 
 /// Whether the vertex attributes of the permutation (from its fetch shader) are specialized
@@ -1520,6 +1525,15 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
                                 std::memory_order_relaxed);
     boost::container::small_vector<u32, 160> selection_words;
     const auto runtime_bytes = std::as_bytes(std::span{&runtime_info, 1});
+    const auto reuse_permutation = [&](u32 perm) {
+        Common::Perf::Add(Common::Perf::SpecMemoHits);
+        info.AddBindings(binding);
+        auto& module = program->modules[perm];
+        if (!module.spec.fetch_shader_data.Empty()) {
+            fetch_shader = &module.spec.fetch_shader_data;
+        }
+        return std::make_tuple(&info, module.module, HashCombine(params.hash, u64{perm}));
+    };
     if (exact_memo) {
         SpecializationInputs(info, binding, selection_words);
         const auto input_bytes = std::as_bytes(
@@ -1530,13 +1544,7 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
             program->modules[perm].module &&
             VertexAttributesMatch(info, runtime_info, program->modules[perm].spec)) {
             Common::Perf::Add(Common::Perf::SelectionMemoHits);
-            Common::Perf::Add(Common::Perf::SpecMemoHits);
-            info.AddBindings(binding);
-            auto& module = program->modules[perm];
-            if (!module.spec.fetch_shader_data.Empty()) {
-                fetch_shader = &module.spec.fetch_shader_data;
-            }
-            return std::make_tuple(&info, module.module, HashCombine(params.hash, u64{perm}));
+            return reuse_permutation(perm);
         }
         Common::Perf::Add(Common::Perf::SelectionMemoMisses);
     }
@@ -1551,10 +1559,8 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     u64 memo_key = 0;
     if (memoize) {
         memo_key = scouted != nullptr ? scouted->memo_key
-                   : exact_memo ? HashCombine(
-                                      XXH3_64bits(selection_words.data(),
-                                                   selection_words.size() * sizeof(u32)),
-                                      XXH3_64bits(&runtime_info, sizeof(runtime_info)))
+                   : exact_memo ? SpecializationKey(
+                                      {selection_words.data(), selection_words.size()}, runtime_info)
                                 : SpecializationKey(info, runtime_info, binding);
         for (const auto& entry : program->memo) {
             // The command processor is the only writer: plain (relaxed) reads.
@@ -1564,15 +1570,8 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
                 entry_perm < program->modules.size() &&
                 program->modules[entry_perm].module &&
                 VertexAttributesMatch(info, runtime_info, program->modules[entry_perm].spec)) {
-                Common::Perf::Add(Common::Perf::SpecMemoHits);
-                info.AddBindings(binding);
-                auto& perm = program->modules[entry_perm];
                 remember_selection(entry_perm);
-                if (auto& fetch = perm.spec.fetch_shader_data; !fetch.Empty()) {
-                    fetch_shader = &fetch;
-                }
-                return std::make_tuple(&program->info, perm.module,
-                                             HashCombine(params.hash, u64{entry_perm}));
+                return reuse_permutation(entry_perm);
             }
         }
         Common::Perf::Add(Common::Perf::SpecMemoMisses);

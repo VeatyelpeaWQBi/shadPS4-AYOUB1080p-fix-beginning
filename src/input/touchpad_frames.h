@@ -19,7 +19,6 @@ public:
         } else if (!pending || stamp != scan) {
             Reset(); publish(std::span<const TouchContact>{}, clicked); return;
         }
-        if (!pending) return;
         for (const auto& finger : incoming) {
             if (received == expected) break;
             if (std::any_of(fingers.begin(), fingers.begin()+received,

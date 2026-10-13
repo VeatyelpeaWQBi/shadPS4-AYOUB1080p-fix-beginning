@@ -20,7 +20,7 @@
 
 namespace Vulkan {
 namespace {
-constexpr size_t Prefix = 16;
+constexpr size_t Prefix = DriverCachePrefix;
 bool Compatible(std::span<const u8> data, const Instance& instance) {
     const auto uuid = instance.GetPipelineCacheUUID();
     return DriverCacheCompatible(data, instance.GetVendorID(), instance.GetDeviceID(),

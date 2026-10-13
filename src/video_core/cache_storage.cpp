@@ -6,7 +6,7 @@
 #include <array>
 #include <atomic>
 #include <cstring>
-#include <map>
+#include <set>
 #include <miniz.h>
 
 #include "common/elf_info.h"
@@ -43,6 +43,14 @@ struct DataBase::Impl {
     bool zip_open{}, allow_legacy{};
     u64 write_budget = 128_MB;
     std::unique_ptr<AsyncCacheWriter> writer;
+
+    void CloseLegacy() {
+        if (zip_open) {
+            mz_zip_reader_end(&legacy_zip);
+            zip_open = false;
+        }
+        allow_legacy = false;
+    }
 
     bool Enqueue(const std::string& name, std::vector<u8>&& data) {
         if (!opened.load(std::memory_order_acquire) || data.empty() ||
@@ -133,13 +141,10 @@ void DataBase::Close() {
     if (!impl->opened.exchange(false, std::memory_order_acq_rel))
         return;
     impl->writer->Close();
-    if (impl->zip_open) {
-        mz_zip_reader_end(&impl->legacy_zip);
-        impl->zip_open = false;
-    }
+    impl->CloseLegacy();
+    const auto counts = impl->writer->Statistics();
     LOG_INFO(Render, "Cache drained: {} blobs saved, {} writes failed, {} budget deferrals",
-             impl->writer->Statistics().written, impl->writer->Statistics().failed,
-             impl->writer->Statistics().deferred);
+             counts.written, counts.failed, counts.deferred);
 }
 
 void DataBase::Reset() {
@@ -158,7 +163,7 @@ void DataBase::Reset() {
         return;
     }
     Open();
-    impl->allow_legacy = false;
+    impl->CloseLegacy();
     impl->Enqueue("legacy-import-complete", std::vector<u8>{1});
     LOG_INFO(Render, "Incompatible cache moved to {}", old.string());
 }
@@ -190,13 +195,13 @@ void DataBase::Load(BlobType type, const std::string& name, std::vector<u32>& da
 void DataBase::ForEachBlob(BlobType type, const std::function<void(std::vector<u8>&& data)>& func) {
     if (!IsOpened())
         return;
-    std::map<std::string, bool> names;
+    std::set<std::string> names;
     const auto collect = [&](const std::filesystem::path& directory) {
         std::error_code ec;
         for (std::filesystem::directory_iterator it{directory, ec}, end; !ec && it != end;
              it.increment(ec)) {
             if (it->is_regular_file(ec) && it->path().extension() == Extension(type))
-                names.emplace(it->path().filename().string(), true);
+                names.emplace(it->path().filename().string());
         }
     };
     collect(impl->path);
@@ -208,10 +213,10 @@ void DataBase::ForEachBlob(BlobType type, const std::function<void(std::vector<u
             mz_zip_reader_get_filename(&impl->legacy_zip, index, name.data(), name.size());
             const std::filesystem::path entry{name.data()};
             if (entry.filename() == entry && entry.extension() == Extension(type))
-                names.emplace(name.data(), true);
+                names.emplace(name.data());
         }
     }
-    for (const auto& [name, unused] : names) {
+    for (const auto& name : names) {
         std::vector<u8> data;
         if (impl->Read(name, data))
             func(std::move(data));
@@ -219,6 +224,8 @@ void DataBase::ForEachBlob(BlobType type, const std::function<void(std::vector<u
 }
 
 void DataBase::FinishPreload() {
+    if (!IsOpened())
+        return;
     if (impl->allow_legacy) {
         // Import all existing SPIR-V, including orphan stages not referenced by a
         // pipeline key. A marker is queued last and only after every import was accepted.
@@ -226,10 +233,6 @@ void DataBase::FinishPreload() {
         if (impl->writer->Statistics().deferred == 0)
             impl->Enqueue("legacy-import-complete", std::vector<u8>{1});
     }
-    if (impl->zip_open) {
-        mz_zip_reader_end(&impl->legacy_zip);
-        impl->zip_open = false;
-    }
-    impl->allow_legacy = false;
+    impl->CloseLegacy();
 }
 } // namespace Storage

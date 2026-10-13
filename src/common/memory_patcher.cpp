@@ -244,23 +244,21 @@ static void ApplyBuiltInFixes() {
     if (profile != nullptr && std::string_view{profile} == "0") {
         return;
     }
+    constexpr std::string_view Address = "0x005f0cbd";
+    constexpr std::string_view Value = "4531C990";
+    constexpr std::string_view OriginalHash = "5c04f08ca74bb842";
     struct BuiltInFix {
         std::string_view serial;
         std::string_view name;
-        std::string_view address; // as in the patch files (executable loaded at 0x400000)
-        std::string_view value;
-        std::string_view original_hash;
         std::string_view app_version{}; // empty: retain the original byte-checked version policy
     };
     static constexpr std::array fixes{
         // inFAMOUS Second Son, PS4 Pro mode: its checkerboard rendering shows a green screen,
         // the game renders natively instead (sete r9b -> xor r9d, r9d).
-        BuiltInFix{"CUSA00004", "PS4 Pro mode without checkerboard (built in)", "0x005f0cbd",
-                   "4531C990", "5c04f08ca74bb842"},
+        BuiltInFix{"CUSA00004", "PS4 Pro mode without checkerboard (built in)"},
         // CUSA00309 01.07: verified against the user's dumped executable. The instruction
         // and its offset match the EU patch; other HK versions are not assumed compatible.
-        BuiltInFix{"CUSA00309", "PS4 Pro mode without checkerboard (HK 01.07, built in)",
-                   "0x005f0cbd", "4531C990", "5c04f08ca74bb842", "01.07"},
+        BuiltInFix{"CUSA00309", "PS4 Pro mode without checkerboard (HK 01.07, built in)", "01.07"},
     };
     const auto app_version =
         Common::Singleton<PSF>::Instance()->GetString("APP_VER").value_or("Unknown version");
@@ -273,8 +271,8 @@ static void ApplyBuiltInFixes() {
                         app_version, fix.app_version);
             continue;
         }
-        const u64 offset = std::stoull(std::string{fix.address}, nullptr, 16) - 0x400000;
-        const size_t patch_size = fix.value.size() / 2;
+        const u64 offset = std::stoull(std::string{Address}, nullptr, 16) - 0x400000;
+        constexpr size_t patch_size = Value.size() / 2;
         if (g_eboot_address == 0 || offset >= g_eboot_image_size ||
             patch_size > g_eboot_image_size - offset) {
             LOG_ERROR(Loader, "Built-in fix {} skipped: address is outside the executable",
@@ -285,7 +283,7 @@ static void ApplyBuiltInFixes() {
         bool already = true;
         for (size_t i = 0; i < patch_size; ++i) {
             const auto byte = static_cast<unsigned char>(
-                std::stoul(std::string{fix.value.substr(i * 2, 2)}, nullptr, 16));
+                std::stoul(std::string{Value.substr(i * 2, 2)}, nullptr, 16));
             if (current[i] != byte) {
                 already = false;
                 break;
@@ -298,8 +296,8 @@ static void ApplyBuiltInFixes() {
         PatchMemory({
             .gameSerial = std::string{fix.serial},
             .modNameStr = std::string{fix.name},
-            .offsetStr = std::string{fix.address},
-            .valueStr = std::string{fix.value},
+            .offsetStr = std::string{Address},
+            .valueStr = std::string{Value},
             .targetStr = "",
             .sizeStr = "",
             .isOffset = false,
@@ -307,7 +305,7 @@ static void ApplyBuiltInFixes() {
             .patchMask = PatchMask::None,
             .maskOffset = 0,
             .originalStr = "",
-            .originalHashStr = std::string{fix.original_hash},
+            .originalHashStr = std::string{OriginalHash},
         });
     }
 }

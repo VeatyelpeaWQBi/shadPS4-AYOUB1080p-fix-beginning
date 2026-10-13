@@ -22,14 +22,18 @@ Uint32 mouse_polling_id = 0;
 static MouseInput mouse_input;
 static std::mutex mouse_poll_mutex;
 
+static bool IsCapturedMouseButton(const InputEvent& event) {
+    return event.input.type == InputType::KeyboardMouse &&
+           (event.input.sdl_id == SDL_BUTTON_LEFT || event.input.sdl_id == SDL_BUTTON_RIGHT);
+}
+
 static void ForgetCapturedMouseButtons() {
     const auto mode = mouse_input.Mode();
     if (mode != MouseMode::Gyro && mode != MouseMode::Touchpad) return;
     // Require a new press after releasing capture; do not reactivate a held mouse
     // button through its ordinary game binding. Physical gamepad inputs stay intact.
     pressed_keys.remove_if([](const auto& key) {
-        return key.first.input.type == InputType::KeyboardMouse &&
-            (key.first.input.sdl_id == SDL_BUTTON_LEFT || key.first.input.sdl_id == SDL_BUTTON_RIGHT);
+        return IsCapturedMouseButton(key.first);
     });
 }
 
@@ -113,35 +117,22 @@ void EmulateJoystick(GameController* controller, u32 interval) {
     float angle = atan2(d_y, d_x);
     float a_x = cos(angle) * output_speed, a_y = sin(angle) * output_speed;
 
-    if (d_x != 0 || d_y != 0) {
-        controller->Axis(axis_x, GetAxis(-0x80, 0x7f, a_x), false);
-        controller->Axis(axis_y, GetAxis(-0x80, 0x7f, a_y), false);
-    } else {
-        controller->Axis(axis_x, GetAxis(-0x80, 0x7f, 0), false);
-        controller->Axis(axis_y, GetAxis(-0x80, 0x7f, 0), false);
-    }
+    if (d_x == 0 && d_y == 0) a_x = a_y = 0;
+    controller->Axis(axis_x, GetAxis(-0x80, 0x7f, a_x), false);
+    controller->Axis(axis_y, GetAxis(-0x80, 0x7f, a_y), false);
 }
 
 void ApplyMouseInputBlockers() {
-    switch (GetMouseMode()) {
-    case MouseMode::Gyro:
-    case MouseMode::Touchpad:
-        for (auto& k : pressed_keys) {
-            if (k.first.input.type == InputType::KeyboardMouse &&
-                (k.first.input.sdl_id == SDL_BUTTON_LEFT ||
-                 k.first.input.sdl_id == SDL_BUTTON_RIGHT)) {
-                k.second = true;
-            }
-        }
-        break;
-    default:
-        break;
+    const auto mode = GetMouseMode();
+    if (mode != MouseMode::Gyro && mode != MouseMode::Touchpad) return;
+    for (auto& [event, blocked] : pressed_keys) {
+        if (IsCapturedMouseButton(event)) blocked = true;
     }
 }
 
 Uint32 MousePolling(void* param, Uint32 id, Uint32 interval) {
     std::scoped_lock lock{mouse_poll_mutex};
-    auto* controller = (GameController*)param;
+    auto* controller = static_cast<GameController*>(param);
     mouse_input.Tick(SDL_GetTicks());
     const auto sample = mouse_input.Read();
     if (sample.mode == MouseMode::Joystick) {

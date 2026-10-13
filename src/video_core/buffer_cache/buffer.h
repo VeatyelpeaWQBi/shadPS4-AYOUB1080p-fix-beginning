@@ -170,6 +170,8 @@ struct StreamBuffer : public Buffer {
     }
 
 private:
+    void AlignMapSize(u64& size, u64& alignment) const;
+
     struct Watch {
         u64 tick{};
         u64 upper_bound{};

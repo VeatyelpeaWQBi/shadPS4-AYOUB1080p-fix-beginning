@@ -28,10 +28,6 @@
 
 namespace Core::PerfSampler {
 
-namespace {
-
-} // Anonymous namespace
-
 void ApplyGameProfile(std::string_view serial) {
     // inFAMOUS Second Son (EU, US, HK): emulator-level settings shared across regions.
     // Game executable patches remain region/version specific. perf_tuning.ini can change

@@ -331,25 +331,26 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage,
                                      u64* permutation_hash) {
     if (stage >= MaxShaderStages)
         return false;
+    const auto select_stage = [&](Program& program, size_t index) {
+        auto& module = program.modules[index];
+        if (permutation_hash)
+            *permutation_hash = HashCombine(program.info.pgm_hash, u64{index});
+        infos[stage] = &program.info;
+        prewarmed_specs[stage] = &module.spec;
+        modules[stage] = module.module;
+        runtime_infos[stage] = module.spec.runtime_info;
+        if (!module.spec.fetch_shader_data.Empty())
+            fetch_shader = &module.spec.fetch_shader_data;
+        return true;
+    };
     const u64 identity = XXH3_64bits(ar.CurrPtr(), ar.Remaining());
     if (const auto cached = prewarmed_stages.find(identity); cached != prewarmed_stages.end()) {
         std::shared_lock lock{program_cache_mutex};
         const auto program = program_cache.find(cached->second.first);
         if (program != program_cache.end() &&
             cached->second.second < program->second->modules.size()) {
-            auto& module = program->second->modules[cached->second.second];
-            if (module.module) {
-                if (permutation_hash)
-                    *permutation_hash = HashCombine(cached->second.first,
-                                                    u64{cached->second.second});
-                infos[stage] = &program->second->info;
-                prewarmed_specs[stage] = &module.spec;
-                modules[stage] = module.module;
-                runtime_infos[stage] = module.spec.runtime_info;
-                if (!module.spec.fetch_shader_data.Empty())
-                    fetch_shader = &module.spec.fetch_shader_data;
-                return true;
-            }
+            if (program->second->modules[cached->second.second].module)
+                return select_stage(*program->second, cached->second.second);
         }
     }
     if (!prewarm_budget.CanContinue(AvailableHostMemory(), AvailableDeviceMemory(instance),
@@ -359,7 +360,7 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage,
     Shader::StageSpecialization spec{};
     spec.info = &program->info;
     size_t perm_idx{};
-    if (stage >= MaxShaderStages || !LoadShaderMeta(ar, program->info, spec, perm_idx) ||
+    if (!LoadShaderMeta(ar, program->info, spec, perm_idx) ||
         perm_idx > 4095 || u32(program->info.sw_stage) >= Shader::MaxStageTypes) {
         return false;
     }
@@ -386,13 +387,7 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage,
     const size_t old_slots = new_program ? 0 : it_pgm.value()->modules.size();
     const u64 slot_bytes =
         perm_idx + 1 > old_slots ? (perm_idx + 1 - old_slots) * sizeof(Program::Module) : 0;
-    if (new_program) {
-        if (!CanPrewarm(spv.size() * sizeof(u32) * 4 + ar.SizeBytes() + sizeof(Program) +
-                        slot_bytes))
-            return false;
-        module = CompileSPV(spv, instance.GetDevice());
-        it_pgm = program_cache.try_emplace(program->info.pgm_hash, std::move(program)).first;
-    } else {
+    if (!new_program) {
         const auto& cached = it_pgm.value()->modules;
         if (perm_idx < cached.size() && cached[perm_idx].module) {
             Serialization::Archive existing, incoming;
@@ -404,25 +399,21 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage,
                 return false;
             }
             module = cached[perm_idx].module;
-        } else {
-            if (!CanPrewarm(spv.size() * sizeof(u32) * 4 + ar.SizeBytes() + slot_bytes))
-                return false;
-            module = CompileSPV(spv, instance.GetDevice());
         }
+    }
+    if (!module) {
+        if (!CanPrewarm(spv.size() * sizeof(u32) * 4 + ar.SizeBytes() + slot_bytes +
+                        (new_program ? sizeof(Program) : 0)))
+            return false;
+        module = CompileSPV(spv, instance.GetDevice());
+        if (new_program)
+            it_pgm = program_cache.try_emplace(program->info.pgm_hash, std::move(program)).first;
     }
     it_pgm.value()->InsertPermut(module, std::move(spec), perm_idx);
     it_pgm.value()->modules[perm_idx].spec.info = &it_pgm.value()->info;
     prewarmed_stages.emplace(identity, std::pair{it_pgm.value()->info.pgm_hash, perm_idx});
 
-    infos[stage] = &it_pgm.value()->info;
-    prewarmed_specs[stage] = &it_pgm.value()->modules[perm_idx].spec;
-    modules[stage] = module;
-    runtime_infos[stage] = it_pgm.value()->modules[perm_idx].spec.runtime_info;
-    if (auto& fetch = it_pgm.value()->modules[perm_idx].spec.fetch_shader_data; !fetch.Empty()) {
-        fetch_shader = &fetch;
-    }
-
-    return true;
+    return select_stage(*it_pgm.value(), perm_idx);
 }
 
 void PipelineCache::WarmUp() {
@@ -440,8 +431,7 @@ void PipelineCache::WarmUp() {
              prewarm_budget.host_bytes / 1_MB, prewarm_budget.host_reserve / 1_MB,
              prewarm_budget.device_reserve / 1_MB);
 
-    // Starts a fresh cache for the current profile, so it is filled during this session.
-    const auto start_new_cache = [this] {
+    const auto finish_preload = [this] {
         std::vector<u8> new_profile(sizeof(profile));
         std::memcpy(new_profile.data(), &profile, sizeof(profile));
         Storage::DataBase::Instance().Save(Storage::BlobType::ShaderProfile, "profile",
@@ -452,31 +442,14 @@ void PipelineCache::WarmUp() {
     // Check if cache is compatible
     std::vector<u8> profile_data{};
     Storage::DataBase::Instance().Load(Storage::BlobType::ShaderProfile, "profile", profile_data);
-    if (profile_data.empty()) {
-        // A missing/corrupt profile cannot prove that any existing records are compatible.
-        Storage::DataBase::Instance().Reset();
-        start_new_cache();
-        return;
-    }
-    if (profile_data.size() != sizeof(Shader::Profile)) {
-        // Usually happens after an emulator update. Previously the cache was only ignored,
-        // which also disabled saving, so it was never rebuilt and every session recompiled
-        // every shader.
-        LOG_WARNING(Render,
-                    "Pipeline cache profile has unexpected size ({} != {}). Rebuilding the cache",
-                    profile_data.size(), sizeof(Shader::Profile));
-        Storage::DataBase::Instance().Reset();
-        start_new_cache();
-        return;
-    }
-
     Shader::Profile cached_profile{};
-    std::memcpy(&cached_profile, profile_data.data(), sizeof(cached_profile));
-    if (cached_profile != profile) {
-        LOG_WARNING(Render,
-                    "Pipeline cache isn't compatible with current system. Rebuilding the cache");
+    const bool valid_size = profile_data.size() == sizeof(cached_profile);
+    if (valid_size)
+        std::memcpy(&cached_profile, profile_data.data(), sizeof(cached_profile));
+    if (!valid_size || cached_profile != profile) {
+        LOG_WARNING(Render, "Missing, invalid or incompatible pipeline cache profile; rebuilding");
         Storage::DataBase::Instance().Reset();
-        start_new_cache();
+        finish_preload();
         return;
     }
 
@@ -565,11 +538,7 @@ void PipelineCache::WarmUp() {
                     num_total_pipelines - num_pipelines);
     }
 
-    std::vector<u8> current_profile(sizeof(profile));
-    std::memcpy(current_profile.data(), &profile, sizeof(profile));
-    Storage::DataBase::Instance().Save(Storage::BlobType::ShaderProfile, "profile",
-                                       std::move(current_profile));
-    Storage::DataBase::Instance().FinishPreload();
+    finish_preload();
 }
 
 void PipelineCache::Sync() {
