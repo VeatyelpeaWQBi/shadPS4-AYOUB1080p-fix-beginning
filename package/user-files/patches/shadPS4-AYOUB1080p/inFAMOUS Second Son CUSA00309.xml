@@ -1,8 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
   inFAMOUS Second Son (CUSA00309, APP_VER 01.07) - patches for the shadPS4-AYOUB1080p build.
-  Hong Kong adaptation: all 48 patch-line hashes verified on the user's APP_VER 01.07 SELF.
+  Hong Kong adaptation: all 48 original patch-line hashes verified on the user's APP_VER 01.07 SELF.
   SELF SHA256: 2d1ca79630d7bbe6fa29575f59aa7996d43071d74ac8e4f7d40137967d9039ab
+  Two local experimental entries (10 lines) are appended below, disabled by default.
   Defaults match the original EU profile (PS4 Pro 3200x1800); enable only one resolution patch.
   Opening progression and stable 4K/60 FPS still require runtime validation.
   Unofficial, not affiliated with or endorsed by Sony Interactive Entertainment or Sucker Punch Productions.
@@ -106,6 +107,26 @@
       <Line Type="bytes" Address="0x00980f7d" Value="9F477400" OriginalHash="d278f8221bd41bd0"/>
       <Line Type="bytes" Address="0x009805b5" Value="67517400" OriginalHash="b5bbd82d8d2994d2"/>
       <Line Type="bytes" Address="0x009810e3" Value="39467400" OriginalHash="e62862773e182757"/>
+    </PatchList>
+  </Metadata>
+
+  <!-- Locally developed experimental additions; static checks passed, runtime not verified. -->
+  <Metadata Title="inFAMOUS Second Son" Name="4K exposure reduction buffers: 1024 tiles (experimental)" Note="Expands both luminance reduction buffers from 625 floats / 2500 bytes to 1024 floats / 4096 bytes. 3840x2160 needs 30x30=900 tiles of 128x72 pixels. Covers the standalone and inlined initialization paths. Static capacity fix; appearance and stability still need runtime verification. Keep Bigger light list enabled separately." Author="Local Codex analysis" PatchVer="0.1" AppVer="01.07" AppElf="eboot.bin" isEnabled="false">
+    <PatchList>
+      <Line Type="bytes" Address="0x0057132a" Value="BE00100000" OriginalHash="edf964a5a1e51572"/>
+      <Line Type="bytes" Address="0x0057134e" Value="B900040000" OriginalHash="5705613ca24709df"/>
+      <Line Type="bytes" Address="0x00571374" Value="BE00100000" OriginalHash="edf964a5a1e51572"/>
+      <Line Type="bytes" Address="0x00571398" Value="B900040000" OriginalHash="5705613ca24709df"/>
+      <Line Type="bytes" Address="0x00572340" Value="BE00100000" OriginalHash="edf964a5a1e51572"/>
+      <Line Type="bytes" Address="0x00572363" Value="B900040000" OriginalHash="5705613ca24709df"/>
+      <Line Type="bytes" Address="0x00572387" Value="BE00100000" OriginalHash="edf964a5a1e51572"/>
+      <Line Type="bytes" Address="0x005723aa" Value="B900040000" OriginalHash="5705613ca24709df"/>
+    </PatchList>
+  </Metadata>
+  <Metadata Title="inFAMOUS Second Son" Name="Force SDR rendering and output (experimental)" Note="Suppresses the game HDR capability flag and forces its active HDR decision to false. The existing SDR rendering, buffer-format, output-mode and gamma paths remain in use, independently of resolution. Does not change Windows or monitor HDR. Does not by itself fix the 4K luminance buffer capacity. Restart the game after changing this patch." Author="Local Codex analysis" PatchVer="0.1" AppVer="01.07" AppElf="eboot.bin" isEnabled="false">
+    <PatchList>
+      <Line Type="bytes" Address="0x005eff77" Value="C683090FDF0000" OriginalHash="c72d8b7cc8647e38"/>
+      <Line Type="bytes" Address="0x005f0ca0" Value="31C090" OriginalHash="060e271885d09b43"/>
     </PatchList>
   </Metadata>
 </Patch>
